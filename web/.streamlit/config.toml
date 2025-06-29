@@ -7,6 +7,7 @@
 developmentMode = false
 
 [server]
+maxUploadSize = 1000
 headless = false
 port = 8501
 enableCORS = false
@@ -21,4 +22,5 @@ backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f0f2f6"
 textColor = "#262730"
 font = "sans serif"
+
 """
