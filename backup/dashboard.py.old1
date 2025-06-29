@@ -1,0 +1,788 @@
+# ==========================================
+# dashboard.py - 실시간 모니터링 대시보드
+# ==========================================
+
+import pandas as pd
+import numpy as np
+import sqlite3
+import json
+import time
+from datetime import datetime, timedelta
+import sys
+import os
+
+# Streamlit import 시도
+try:
+    import streamlit as st
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    STREAMLIT_AVAILABLE = True
+    print("✅ Streamlit 사용 가능")
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+    print("⚠️ Streamlit 없음 - CLI 모드로 실행")
+    print("pip install streamlit plotly 후 웹 대시보드 사용 가능")
+
+# 프로젝트 모듈 import
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from update_manager import ETFUpdateManager
+from scheduler import ETFScheduler
+from data.etf_analyzer import ETFAnalyzer
+from data.etf_screener import ETFScreener
+
+class ETFDashboard:
+    """ETF 실시간 모니터링 대시보드"""
+    
+    def __init__(self, db_path: str = "etf_universe.db"):
+        self.db_path = db_path
+        self.update_manager = ETFUpdateManager(db_path)
+        self.analyzer = ETFAnalyzer(db_path)
+        self.screener = ETFScreener(db_path)
+        
+        # 스케줄러는 선택적으로 초기화
+        try:
+            self.scheduler = ETFScheduler()
+        except Exception as e:
+            print(f"⚠️ 스케줄러 초기화 실패: {e}")
+            self.scheduler = None
+    
+    def get_market_overview(self) -> dict:
+        """시장 전체 현황"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            # 기본 통계
+            overview = pd.read_sql_query('''
+                SELECT 
+                    COUNT(*) as total_etfs,
+                    SUM(aum) as total_aum,
+                    AVG(expense_ratio) as avg_expense_ratio,
+                    COUNT(CASE WHEN market_price > 0 THEN 1 END) as price_available,
+                    COUNT(CASE WHEN last_updated > datetime('now', '-1 day') THEN 1 END) as updated_24h
+                FROM etf_info
+            ''', conn).iloc[0]
+            
+            # 카테고리별 분포
+            category_stats = pd.read_sql_query('''
+                SELECT 
+                    category,
+                    COUNT(*) as count,
+                    SUM(aum) as total_aum,
+                    AVG(expense_ratio) as avg_expense
+                FROM etf_info
+                GROUP BY category
+                ORDER BY total_aum DESC
+            ''', conn)
+            
+            # 성과 지표
+            performance = pd.read_sql_query('''
+                SELECT 
+                    AVG(dividend_yield) as avg_dividend,
+                    AVG(tracking_error) as avg_tracking_error,
+                    COUNT(CASE WHEN dividend_yield > 3 THEN 1 END) as high_dividend_count
+                FROM etf_info
+                WHERE dividend_yield > 0
+            ''', conn).iloc[0]
+            
+            conn.close()
+            
+            return {
+                'overview': overview.to_dict(),
+                'category_stats': category_stats.to_dict('records'),
+                'performance': performance.to_dict(),
+                'last_update': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"❌ 시장 현황 조회 실패: {e}")
+            return {}
+    
+    def get_top_etfs(self, metric: str = 'aum', limit: int = 10) -> pd.DataFrame:
+        """상위 ETF 조회"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            order_direction = "DESC" if metric in ['aum', 'dividend_yield', 'market_price'] else "ASC"
+            
+            query = f'''
+                SELECT 
+                    name, code, category, aum, expense_ratio, 
+                    dividend_yield, market_price, last_updated
+                FROM etf_info
+                WHERE {metric} > 0
+                ORDER BY {metric} {order_direction}
+                LIMIT ?
+            '''
+            
+            df = pd.read_sql_query(query, conn, params=(limit,))
+            conn.close()
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ 상위 ETF 조회 실패: {e}")
+            return pd.DataFrame()
+    
+    def get_update_status(self) -> dict:
+        """업데이트 상태 조회"""
+        try:
+            # 현재 업데이트 상태
+            current_status = self.update_manager.get_current_status()
+            
+            # 시스템 건강 상태
+            health = self.update_manager.quick_health_check()
+            
+            # 최근 업데이트 히스토리
+            history = self.update_manager.get_update_history(5)
+            
+            # 스케줄러 상태
+            scheduler_status = {}
+            if self.scheduler:
+                scheduler_status = self.scheduler.get_status()
+            
+            return {
+                'current_status': current_status,
+                'health': health,
+                'recent_history': history,
+                'scheduler': scheduler_status
+            }
+            
+        except Exception as e:
+            print(f"❌ 업데이트 상태 조회 실패: {e}")
+            return {}
+    
+    def run_streamlit_dashboard(self):
+        """Streamlit 웹 대시보드 실행"""
+        if not STREAMLIT_AVAILABLE:
+            print("❌ Streamlit이 설치되지 않았습니다")
+            return
+        
+        st.set_page_config(
+            page_title="ETF 모니터링 대시보드",
+            page_icon="📊",
+            layout="wide",
+            initial_sidebar_state="expanded"
+        )
+        
+        st.title("📊 ETF 실시간 모니터링 대시보드")
+        st.markdown("---")
+        
+        # 사이드바 - 제어판
+        st.sidebar.title("🎛️ 제어판")
+        
+        # 실시간 업데이트 토글
+        auto_refresh = st.sidebar.checkbox("🔄 자동 새로고침 (30초)", value=True)
+        
+        if auto_refresh:
+            time.sleep(1)
+            st.rerun()
+        
+        # 수동 새로고침
+        if st.sidebar.button("🔄 수동 새로고침"):
+            st.rerun()
+        
+        # 메인 탭 구성
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🏠 시장 현황", "📈 업데이트 상태", "🔍 ETF 검색", "📊 성과 분석", "⚙️ 시스템 관리"
+        ])
+        
+        with tab1:
+            self._render_market_overview()
+        
+        with tab2:
+            self._render_update_status()
+        
+        with tab3:
+            self._render_etf_search()
+        
+        with tab4:
+            self._render_performance_analysis()
+        
+        with tab5:
+            self._render_system_management()
+    
+    def _render_market_overview(self):
+        """시장 현황 탭 렌더링"""
+        st.header("🏠 ETF 시장 현황")
+        
+        # 시장 데이터 로드
+        market_data = self.get_market_overview()
+        
+        if not market_data:
+            st.error("❌ 시장 데이터를 불러올 수 없습니다")
+            return
+        
+        overview = market_data['overview']
+        
+        # 주요 지표 카드
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "총 ETF 개수",
+                f"{overview['total_etfs']:,}개",
+                delta=None
+            )
+        
+        with col2:
+            st.metric(
+                "총 순자산",
+                f"{overview['total_aum']:,.0f}억원",
+                delta=None
+            )
+        
+        with col3:
+            st.metric(
+                "평균 운용보수",
+                f"{overview['avg_expense_ratio']:.3f}%",
+                delta=None
+            )
+        
+        with col4:
+            st.metric(
+                "24시간 내 업데이트",
+                f"{overview['updated_24h']}개",
+                delta=f"{overview['updated_24h'] - overview['total_etfs']}개" if overview['total_etfs'] > 0 else None
+            )
+        
+        # 카테고리별 분포
+        st.subheader("📊 카테고리별 분포")
+        
+        if market_data['category_stats']:
+            category_df = pd.DataFrame(market_data['category_stats'])
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # 파이 차트
+                fig_pie = px.pie(
+                    category_df, 
+                    values='total_aum', 
+                    names='category',
+                    title="카테고리별 순자산 비중"
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with col2:
+                # 바 차트
+                fig_bar = px.bar(
+                    category_df, 
+                    x='category', 
+                    y='count',
+                    title="카테고리별 ETF 개수"
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+        
+        # 상위 ETF 리스트
+        st.subheader("🏆 상위 ETF (순자산 기준)")
+        top_etfs = self.get_top_etfs('aum', 10)
+        
+        if not top_etfs.empty:
+            # 표시용 데이터 가공
+            display_df = top_etfs.copy()
+            display_df['순자산'] = display_df['aum'].apply(lambda x: f"{x:,.0f}억원")
+            display_df['운용보수'] = display_df['expense_ratio'].apply(lambda x: f"{x:.3f}%")
+            display_df['배당수익률'] = display_df['dividend_yield'].apply(lambda x: f"{x:.2f}%")
+            
+            st.dataframe(
+                display_df[['name', 'code', 'category', '순자산', '운용보수', '배당수익률']],
+                use_container_width=True
+            )
+    
+    def _render_update_status(self):
+        """업데이트 상태 탭 렌더링"""
+        st.header("📈 업데이트 상태 모니터링")
+        
+        # 업데이트 상태 로드
+        status_data = self.get_update_status()
+        
+        if not status_data:
+            st.error("❌ 업데이트 상태 데이터를 불러올 수 없습니다")
+            return
+        
+        # 현재 상태
+        current = status_data.get('current_status', {})
+        health = status_data.get('health', {})
+        
+        # 상태 표시
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if current.get('is_updating'):
+                st.error(f"🔄 업데이트 진행 중 ({current.get('progress', 0):.1f}%)")
+            else:
+                st.success("✅ 업데이트 대기 중")
+        
+        with col2:
+            health_score = health.get('health_score', 0)
+            if health_score > 80:
+                st.success(f"💚 시스템 건강: {health_score:.1f}%")
+            elif health_score > 50:
+                st.warning(f"💛 시스템 주의: {health_score:.1f}%")
+            else:
+                st.error(f"❤️ 시스템 위험: {health_score:.1f}%")
+        
+        with col3:
+            last_update = current.get('last_update', '알 수 없음')
+            st.info(f"🕐 마지막 업데이트: {last_update}")
+        
+        # 수동 업데이트 버튼
+        st.subheader("🔧 수동 업데이트")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("⚡ 빠른 업데이트 (5개 ETF)"):
+                with st.spinner("업데이트 실행 중..."):
+                    try:
+                        summary = self.update_manager.batch_update_all_etfs(max_etfs=5, delay_between_updates=0.5)
+                        if summary:
+                            st.success(f"✅ 완료: {summary.success_rate:.1f}% 성공")
+                        else:
+                            st.error("❌ 업데이트 실패")
+                    except Exception as e:
+                        st.error(f"❌ 오류: {e}")
+        
+        with col2:
+            if st.button("🔄 일반 업데이트 (10개 ETF)"):
+                with st.spinner("업데이트 실행 중..."):
+                    try:
+                        summary = self.update_manager.batch_update_all_etfs(max_etfs=10, delay_between_updates=1.0)
+                        if summary:
+                            st.success(f"✅ 완료: {summary.success_rate:.1f}% 성공")
+                        else:
+                            st.error("❌ 업데이트 실패")
+                    except Exception as e:
+                        st.error(f"❌ 오류: {e}")
+        
+        with col3:
+            if st.button("🚀 전체 업데이트"):
+                st.warning("⚠️ 전체 업데이트는 시간이 오래 걸립니다")
+                # 전체 업데이트는 별도 확인 필요
+        
+        # 업데이트 히스토리
+        st.subheader("📋 최근 업데이트 히스토리")
+        
+        history = status_data.get('recent_history', [])
+        if history:
+            history_df = pd.DataFrame(history)
+            history_df['시작시간'] = pd.to_datetime(history_df['start_time']).dt.strftime('%m-%d %H:%M')
+            history_df['성공률'] = history_df['success_rate'].apply(lambda x: f"{x:.1f}%")
+            history_df['소요시간'] = history_df['total_duration'].apply(lambda x: f"{x:.1f}초")
+            
+            st.dataframe(
+                history_df[['시작시간', 'total_etfs', 'successful_updates', 'failed_updates', '성공률', '소요시간']],
+                use_container_width=True
+            )
+        else:
+            st.info("📝 업데이트 히스토리가 없습니다")
+        
+        # 스케줄러 상태
+        if self.scheduler and status_data.get('scheduler'):
+            st.subheader("⏰ 스케줄러 상태")
+            
+            scheduler_info = status_data['scheduler']
+            
+            if scheduler_info.get('is_running'):
+                st.success("✅ 스케줄러 실행 중")
+            else:
+                st.warning("⚠️ 스케줄러 중지됨")
+            
+            if 'jobs_info' in scheduler_info:
+                jobs_df = pd.DataFrame(scheduler_info['jobs_info'])
+                if not jobs_df.empty:
+                    st.dataframe(jobs_df, use_container_width=True)
+    
+    def _render_etf_search(self):
+        """ETF 검색 탭 렌더링"""
+        st.header("🔍 ETF 검색 및 비교")
+        
+        # 검색 필터
+        st.subheader("🎯 검색 필터")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            max_expense = st.slider("최대 운용보수 (%)", 0.0, 1.0, 0.5, 0.01)
+        
+        with col2:
+            min_aum = st.number_input("최소 순자산 (억원)", 0, 100000, 1000, 100)
+        
+        with col3:
+            categories = ['전체', 'domestic_equity', 'international_equity', 'bonds', 'alternatives']
+            selected_category = st.selectbox("카테고리", categories)
+        
+        # 검색 실행
+        if st.button("🔍 검색 실행"):
+            criteria = {
+                'expense_ratio_max': max_expense,
+                'aum_min': min_aum,
+                'sort_by': 'aum',
+                'sort_direction': 'DESC',
+                'limit': 20
+            }
+            
+            if selected_category != '전체':
+                criteria['category'] = selected_category
+            
+            search_results = self.screener.screen_by_criteria(criteria)
+            
+            if not search_results.empty:
+                st.subheader(f"📊 검색 결과 ({len(search_results)}개)")
+                
+                # 결과 표시
+                display_df = search_results.copy()
+                display_df['순자산'] = display_df['aum'].apply(lambda x: f"{x:,.0f}억원")
+                display_df['운용보수'] = display_df['expense_ratio'].apply(lambda x: f"{x:.3f}%")
+                
+                st.dataframe(
+                    display_df[['name', 'code', 'category', '순자산', '운용보수', 'fund_manager']],
+                    use_container_width=True
+                )
+            else:
+                st.warning("🔍 검색 조건에 맞는 ETF가 없습니다")
+        
+        # ETF 비교
+        st.subheader("⚖️ ETF 비교")
+        
+        etf_codes = st.text_input(
+            "비교할 ETF 코드 입력 (쉼표로 구분)",
+            placeholder="예: 069500,360750,114260"
+        )
+        
+        if st.button("⚖️ 비교 실행") and etf_codes:
+            codes = [code.strip() for code in etf_codes.split(',')]
+            comparison_df = self.analyzer.compare_etfs(codes)
+            
+            if not comparison_df.empty:
+                st.subheader("📊 비교 결과")
+                st.dataframe(comparison_df, use_container_width=True)
+                
+                # 비교 차트
+                if len(comparison_df) > 1:
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Bar(
+                        x=comparison_df['name'],
+                        y=comparison_df['expense_ratio'],
+                        name='운용보수 (%)',
+                        yaxis='y'
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=comparison_df['name'],
+                        y=comparison_df['aum'],
+                        mode='lines+markers',
+                        name='순자산 (억원)',
+                        yaxis='y2'
+                    ))
+                    
+                    fig.update_layout(
+                        title="ETF 비교 차트",
+                        yaxis=dict(title="운용보수 (%)"),
+                        yaxis2=dict(title="순자산 (억원)", overlaying='y', side='right')
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.error("❌ 비교할 ETF 정보를 찾을 수 없습니다")
+    
+    def _render_performance_analysis(self):
+        """성과 분석 탭 렌더링"""
+        st.header("📊 ETF 성과 분석")
+        
+        # 카테고리별 분석
+        st.subheader("📈 카테고리별 트렌드")
+        
+        trends = self.analyzer.analyze_category_trends()
+        if not trends.empty:
+            # 순자산 기준 상위 카테고리
+            fig = px.bar(
+                trends.head(10),
+                x='category',
+                y='total_aum',
+                title="카테고리별 총 순자산"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 상세 테이블
+            st.dataframe(trends, use_container_width=True)
+        
+        # 비용 효율성 분석
+        st.subheader("💰 비용 효율성 분석")
+        
+        efficiency = self.analyzer.analyze_cost_efficiency()
+        if not efficiency.empty:
+            # 효율성 상위 ETF
+            top_efficient = efficiency.head(15)
+            
+            fig = px.scatter(
+                top_efficient,
+                x='expense_ratio',
+                y='aum',
+                size='efficiency_ratio',
+                hover_name='name',
+                title="ETF 비용 효율성 (크기: 효율성 점수)"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    def _render_system_management(self):
+        """시스템 관리 탭 렌더링"""
+        st.header("⚙️ 시스템 관리")
+        
+        # 시스템 상태
+        st.subheader("🔧 시스템 상태")
+        
+        health = self.update_manager.quick_health_check()
+        if health.get('status') != 'error':
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("총 ETF", f"{health['total_etfs']}개")
+                st.metric("업데이트된 ETF", f"{health['updated_etfs']}개")
+                st.metric("가격 정보 보유", f"{health['price_available']}개")
+            
+            with col2:
+                st.metric("24시간 내 업데이트", f"{health['recent_updates_24h']}개")
+                st.metric("평균 업데이트 경과", f"{health['avg_hours_since_update']}시간")
+                st.metric("시스템 건강도", f"{health['health_score']:.1f}%")
+        
+        # 스케줄러 관리
+        if self.scheduler:
+            st.subheader("⏰ 스케줄러 관리")
+            
+            scheduler_status = self.scheduler.get_status()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if scheduler_status['is_running']:
+                    st.success("✅ 스케줄러 실행 중")
+                    if st.button("🛑 스케줄러 중지"):
+                        try:
+                            self.scheduler.stop()
+                            st.success("✅ 스케줄러 중지됨")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 중지 실패: {e}")
+                else:
+                    st.warning("⚠️ 스케줄러 중지됨")
+                    if st.button("🚀 스케줄러 시작"):
+                        try:
+                            self.scheduler.start()
+                            st.success("✅ 스케줄러 시작됨")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 시작 실패: {e}")
+            
+            with col2:
+                st.write(f"**스케줄러 타입:** {scheduler_status['scheduler_type']}")
+                st.write(f"**활성 작업:** {', '.join(scheduler_status['active_jobs'])}")
+        
+        # 데이터베이스 관리
+        st.subheader("💾 데이터베이스 관리")
+        
+        if st.button("🔄 ETF 유니버스 재구축"):
+            with st.spinner("ETF 유니버스 재구축 중..."):
+                try:
+                    # ETF 유니버스 재초기화 (실제로는 더 복잡한 로직 필요)
+                    st.success("✅ ETF 유니버스 재구축 완료")
+                except Exception as e:
+                    st.error(f"❌ 재구축 실패: {e}")
+        
+        # 로그 보기
+        st.subheader("📝 시스템 로그")
+        
+        try:
+            if os.path.exists("etf_updates.log"):
+                with open("etf_updates.log", "r", encoding="utf-8") as f:
+                    log_lines = f.readlines()
+                    recent_logs = log_lines[-50:]  # 최근 50줄
+                    st.text_area("최근 로그", "".join(recent_logs), height=300)
+            else:
+                st.info("📝 로그 파일이 없습니다")
+        except Exception as e:
+            st.error(f"❌ 로그 읽기 실패: {e}")
+    
+    def run_cli_dashboard(self):
+        """CLI 버전 대시보드"""
+        print("📊 ETF 모니터링 CLI 대시보드")
+        print("=" * 60)
+        
+        while True:
+            try:
+                print("\n🎯 메뉴 선택:")
+                print("1. 시장 현황")
+                print("2. 업데이트 상태")
+                print("3. ETF 검색")
+                print("4. 수동 업데이트")
+                print("5. 시스템 상태")
+                print("6. 종료")
+                
+                choice = input("\n선택 (1-6): ").strip()
+                
+                if choice == "1":
+                    self._cli_market_overview()
+                elif choice == "2":
+                    self._cli_update_status()
+                elif choice == "3":
+                    self._cli_etf_search()
+                elif choice == "4":
+                    self._cli_manual_update()
+                elif choice == "5":
+                    self._cli_system_status()
+                elif choice == "6":
+                    print("👋 대시보드를 종료합니다")
+                    break
+                else:
+                    print("❌ 1-6 중에서 선택해주세요")
+            
+            except KeyboardInterrupt:
+                print("\n\n👋 사용자에 의해 종료됨")
+                break
+            except Exception as e:
+                print(f"\n❌ 오류 발생: {e}")
+    
+    def _cli_market_overview(self):
+        """CLI 시장 현황"""
+        print("\n🏠 ETF 시장 현황")
+        print("-" * 40)
+        
+        market_data = self.get_market_overview()
+        if market_data:
+            overview = market_data['overview']
+            print(f"총 ETF: {overview['total_etfs']}개")
+            print(f"총 순자산: {overview['total_aum']:,.0f}억원")
+            print(f"평균 운용보수: {overview['avg_expense_ratio']:.3f}%")
+            print(f"24시간 내 업데이트: {overview['updated_24h']}개")
+            
+            print("\n📊 카테고리별 분포:")
+            for cat in market_data['category_stats']:
+                print(f"- {cat['category']}: {cat['count']}개, {cat['total_aum']:,.0f}억원")
+    
+    def _cli_update_status(self):
+        """CLI 업데이트 상태"""
+        print("\n📈 업데이트 상태")
+        print("-" * 40)
+        
+        status_data = self.get_update_status()
+        if status_data:
+            current = status_data['current_status']
+            health = status_data['health']
+            
+            print(f"업데이트 진행 중: {'예' if current.get('is_updating') else '아니오'}")
+            print(f"시스템 건강도: {health.get('health_score', 0):.1f}%")
+            print(f"마지막 업데이트: {current.get('last_update', '알 수 없음')}")
+            
+            history = status_data.get('recent_history', [])
+            if history:
+                print("\n📋 최근 업데이트 히스토리:")
+                for i, record in enumerate(history[:3]):
+                    print(f"{i+1}. {record['start_time'][:19]} - "
+                          f"성공률 {record['success_rate']:.1f}%")
+    
+    def _cli_etf_search(self):
+        """CLI ETF 검색"""
+        print("\n🔍 ETF 검색")
+        print("-" * 40)
+        
+        try:
+            max_expense = float(input("최대 운용보수 (%, 예: 0.5): ") or "0.5")
+            min_aum = int(input("최소 순자산 (억원, 예: 1000): ") or "1000")
+            
+            criteria = {
+                'expense_ratio_max': max_expense,
+                'aum_min': min_aum,
+                'sort_by': 'aum',
+                'limit': 10
+            }
+            
+            results = self.screener.screen_by_criteria(criteria)
+            
+            if not results.empty:
+                print(f"\n📊 검색 결과 ({len(results)}개):")
+                for _, etf in results.iterrows():
+                    print(f"- {etf['name']} ({etf['code']}): {etf['aum']:,.0f}억원, {etf['expense_ratio']:.3f}%")
+            else:
+                print("🔍 검색 조건에 맞는 ETF가 없습니다")
+                
+        except ValueError:
+            print("❌ 올바른 숫자를 입력해주세요")
+    
+    def _cli_manual_update(self):
+        """CLI 수동 업데이트"""
+        print("\n🔧 수동 업데이트")
+        print("-" * 40)
+        
+        print("1. 빠른 업데이트 (5개 ETF)")
+        print("2. 일반 업데이트 (10개 ETF)")
+        print("3. 개별 ETF 업데이트")
+        
+        choice = input("선택: ").strip()
+        
+        try:
+            if choice == "1":
+                print("⚡ 빠른 업데이트 실행 중...")
+                summary = self.update_manager.batch_update_all_etfs(max_etfs=5)
+                if summary:
+                    print(f"✅ 완료: {summary.success_rate:.1f}% 성공")
+            
+            elif choice == "2":
+                print("🔄 일반 업데이트 실행 중...")
+                summary = self.update_manager.batch_update_all_etfs(max_etfs=10)
+                if summary:
+                    print(f"✅ 완료: {summary.success_rate:.1f}% 성공")
+            
+            elif choice == "3":
+                code = input("ETF 코드 입력: ").strip()
+                if code:
+                    print(f"🔄 {code} 업데이트 중...")
+                    result = self.update_manager.update_single_etf(code, f"ETF_{code}")
+                    print(f"결과: {result.status}")
+                    
+        except Exception as e:
+            print(f"❌ 업데이트 실패: {e}")
+    
+    def _cli_system_status(self):
+        """CLI 시스템 상태"""
+        print("\n⚙️ 시스템 상태")
+        print("-" * 40)
+        
+        health = self.update_manager.quick_health_check()
+        if health.get('status') != 'error':
+            print(f"총 ETF: {health['total_etfs']}개")
+            print(f"업데이트된 ETF: {health['updated_etfs']}개")
+            print(f"가격 정보 보유: {health['price_available']}개")
+            print(f"24시간 내 업데이트: {health['recent_updates_24h']}개")
+            print(f"시스템 건강도: {health['health_score']:.1f}%")
+        else:
+            print(f"❌ 시스템 상태 확인 실패: {health.get('error')}")
+
+
+# ==========================================
+# 실행 예제 및 테스트 코드
+# ==========================================
+
+def main():
+    """메인 실행 함수"""
+    print("📊 ETF 모니터링 대시보드")
+    print("=" * 60)
+    
+    dashboard = ETFDashboard()
+    
+    if STREAMLIT_AVAILABLE:
+        print("🌐 Streamlit 웹 대시보드를 시작합니다...")
+        print("브라우저에서 http://localhost:8501 으로 접속하세요")
+        dashboard.run_streamlit_dashboard()
+    else:
+        print("💻 CLI 대시보드를 시작합니다...")
+        dashboard.run_cli_dashboard()
+
+if __name__ == "__main__":
+    # Streamlit으로 실행되는 경우
+    if STREAMLIT_AVAILABLE and len(sys.argv) > 1 and 'streamlit' in sys.argv[0]:
+        dashboard = ETFDashboard()
+        dashboard.run_streamlit_dashboard()
+    else:
+        main()

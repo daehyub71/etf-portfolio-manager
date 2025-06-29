@@ -1,0 +1,658 @@
+# ==========================================
+# data/market_data_collector.py - pykrx 연동 시장 데이터 수집기
+# ==========================================
+
+import pandas as pd
+import numpy as np
+import sqlite3
+import time
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import sys
+import os
+from pathlib import Path
+
+# pykrx import 시도
+try:
+    from pykrx import stock
+    from pykrx import bond
+    PYKRX_AVAILABLE = True
+    print("✅ pykrx 라이브러리 사용 가능")
+except ImportError:
+    PYKRX_AVAILABLE = False
+    print("⚠️ pykrx 라이브러리 없음")
+    print("pip install pykrx 후 실제 데이터 수집 가능")
+
+# 영업일 계산을 위한 라이브러리
+try:
+    import pandas_market_calendars as mcal
+    MARKET_CALENDAR_AVAILABLE = True
+except ImportError:
+    MARKET_CALENDAR_AVAILABLE = False
+    print("⚠️ pandas_market_calendars 없음 - 기본 영업일 계산 사용")
+
+logger = logging.getLogger(__name__)
+
+class MarketDataCollector:
+    """pykrx 기반 시장 데이터 수집기"""
+    
+    def __init__(self, db_path: str = "etf_universe.db"):
+        self.db_path = db_path
+        self.setup_logging()
+        
+        # API 호출 제한을 위한 지연 설정
+        self.api_delay = 0.1  # 100ms 지연
+        self.last_api_call = 0
+        
+        # 캐시 설정
+        self.cache = {}
+        self.cache_ttl = 3600  # 1시간 캐시
+        
+        logger.info(f"MarketDataCollector 초기화 (DB: {db_path})")
+    
+    def setup_logging(self):
+        """로깅 설정"""
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+    
+    def _rate_limit(self):
+        """API 호출 제한"""
+        now = time.time()
+        elapsed = now - self.last_api_call
+        if elapsed < self.api_delay:
+            time.sleep(self.api_delay - elapsed)
+        self.last_api_call = time.time()
+    
+    def _get_cache_key(self, *args) -> str:
+        """캐시 키 생성"""
+        return "_".join(str(arg) for arg in args)
+    
+    def _is_cache_valid(self, key: str) -> bool:
+        """캐시 유효성 확인"""
+        if key not in self.cache:
+            return False
+        
+        cached_time, _ = self.cache[key]
+        return (time.time() - cached_time) < self.cache_ttl
+    
+    def _get_cache(self, key: str):
+        """캐시에서 데이터 가져오기"""
+        if self._is_cache_valid(key):
+            _, data = self.cache[key]
+            return data
+        return None
+    
+    def _set_cache(self, key: str, data):
+        """캐시에 데이터 저장"""
+        self.cache[key] = (time.time(), data)
+    
+    def get_last_business_day(self, date: datetime = None) -> str:
+        """최종 영업일 계산"""
+        if date is None:
+            date = datetime.now()
+        
+        # 한국 시장 기준 영업일 계산
+        if MARKET_CALENDAR_AVAILABLE:
+            try:
+                # 한국 시장 캘린더 사용
+                krx = mcal.get_calendar('XKRX')  # 한국거래소
+                
+                # 최근 5일간의 영업일 조회
+                end_date = date
+                start_date = date - timedelta(days=10)
+                
+                business_days = krx.valid_days(
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                if len(business_days) > 0:
+                    last_business_day = business_days[-1].strftime('%Y%m%d')
+                    logger.info(f"한국거래소 영업일 기준 최종일: {last_business_day}")
+                    return last_business_day
+                    
+            except Exception as e:
+                logger.warning(f"시장 캘린더 사용 실패: {e}")
+        
+        # 기본 영업일 계산 (주말 제외)
+        current_date = date
+        while current_date.weekday() >= 5:  # 토요일(5), 일요일(6) 제외
+            current_date -= timedelta(days=1)
+        
+        # 한국의 주요 공휴일 체크 (간단 버전)
+        holidays_2024 = [
+            '20241225',  # 크리스마스
+            '20241231',  # 연말
+        ]
+        
+        holidays_2025 = [
+            '20250101',  # 신정
+            '20250127', '20250128', '20250129',  # 설날 연휴
+            '20250301',  # 삼일절
+            '20250505',  # 어린이날
+            '20250506',  # 어린이날 대체휴일
+            '20250815',  # 광복절
+            '20251003',  # 개천절
+            '20251006', '20251007', '20251008',  # 추석 연휴
+            '20251009',  # 한글날
+            '20251225',  # 크리스마스
+        ]
+        
+        all_holidays = holidays_2024 + holidays_2025
+        
+        # 공휴일 체크
+        while current_date.strftime('%Y%m%d') in all_holidays:
+            current_date -= timedelta(days=1)
+            # 주말이면 다시 조정
+            while current_date.weekday() >= 5:
+                current_date -= timedelta(days=1)
+        
+        last_business_day = current_date.strftime('%Y%m%d')
+        logger.info(f"계산된 최종 영업일: {last_business_day}")
+        return last_business_day
+    
+    def get_all_etf_list(self) -> List[Dict]:
+        """전체 ETF 종목 리스트 조회"""
+        cache_key = "all_etf_list"
+        cached_data = self._get_cache(cache_key)
+        if cached_data:
+            logger.info("캐시에서 ETF 리스트 반환")
+            return cached_data
+        
+        if not PYKRX_AVAILABLE:
+            logger.warning("pykrx 없음 - 기본 ETF 리스트 반환")
+            return self._get_default_etf_list()
+        
+        try:
+            logger.info("pykrx로 전체 ETF 리스트 조회 시작")
+            self._rate_limit()
+            
+            # ETF 종목 리스트 가져오기
+            etf_tickers = stock.get_etf_ticker_list()
+            logger.info(f"ETF 종목 {len(etf_tickers)}개 조회 완료")
+            
+            etf_list = []
+            last_business_day = self.get_last_business_day()
+            
+            # 각 ETF의 기본 정보 조회 (배치 처리)
+            batch_size = 10  # 한 번에 처리할 종목 수
+            
+            for i in range(0, len(etf_tickers), batch_size):
+                batch_tickers = etf_tickers[i:i+batch_size]
+                logger.info(f"ETF 정보 조회: {i+1}-{min(i+batch_size, len(etf_tickers))}/{len(etf_tickers)}")
+                
+                for ticker in batch_tickers:
+                    try:
+                        self._rate_limit()
+                        
+                        # ETF 기본 정보 조회
+                        etf_info = self._get_etf_basic_info(ticker, last_business_day)
+                        if etf_info:
+                            etf_list.append(etf_info)
+                        
+                    except Exception as e:
+                        logger.error(f"ETF {ticker} 정보 조회 실패: {e}")
+                        continue
+                
+                # 배치마다 조금 더 긴 지연
+                if i + batch_size < len(etf_tickers):
+                    time.sleep(0.5)
+            
+            logger.info(f"ETF 정보 수집 완료: {len(etf_list)}개")
+            
+            # 캐시에 저장
+            self._set_cache(cache_key, etf_list)
+            
+            return etf_list
+            
+        except Exception as e:
+            logger.error(f"ETF 리스트 조회 실패: {e}")
+            return self._get_default_etf_list()
+    
+    def _get_etf_basic_info(self, ticker: str, date: str) -> Optional[Dict]:
+        
+        try:
+        # 영업일 체크
+            if date.weekday() >= 5:  # 주말
+                logger.warning(f"주말입니다. 마지막 영업일 데이터를 사용합니다.")
+                date = self._get_last_business_day(date)
+            """개별 ETF 기본 정보 조회"""
+            try:
+                # ETF 이름 조회
+                try:
+                    # 최근 거래일의 데이터로 이름 조회
+                    df = stock.get_market_ohlcv_by_date(date, date, ticker)
+                    if df.empty:
+                        return None
+                except:
+                    return None
+                
+                # ETF 기본 정보 수집
+                etf_info = {
+                    'code': ticker,
+                    'name': self._get_etf_name(ticker),
+                    'category': self._classify_etf_category(ticker),
+                    'market_price': 0,
+                    'aum': 0,
+                    'last_updated': datetime.now().isoformat()
+                }
+                
+                # 최신 가격 정보 조회
+                try:
+                    price_data = stock.get_market_ohlcv_by_date(date, date, ticker)
+                    if not price_data.empty:
+                        etf_info['market_price'] = float(price_data.iloc[-1]['종가'])
+                        etf_info['volume'] = int(price_data.iloc[-1]['거래량'])
+                except Exception as e:
+                    logger.debug(f"ETF {ticker} 가격 정보 조회 실패: {e}")
+                
+                # ETF 순자산 정보 조회 (가능한 경우)
+                try:
+                    fundamental = stock.get_market_fundamental_by_date(date, date, ticker)
+                    if not fundamental.empty:
+                        # 시가총액을 AUM 대신 사용
+                        market_cap = fundamental.iloc[-1].get('시가총액', 0)
+                        if pd.notna(market_cap):
+                            etf_info['aum'] = float(market_cap) / 100000000  # 억원 단위로 변환
+                except Exception as e:
+                    logger.debug(f"ETF {ticker} 펀더멘털 정보 조회 실패: {e}")
+                
+                return etf_info
+                
+            except Exception as e:
+                logger.debug(f"ETF {ticker} 기본 정보 조회 실패: {e}")
+                return None
+            
+        except Exception as e:
+            logger.error(f"ETF {ticker} 데이터 조회 실패: {str(e)}")
+            return None  # 또는 기본값 반환
+    
+    def _get_etf_name(self, ticker: str) -> str:
+        """ETF 이름 조회"""
+        try:
+            # pykrx에서 종목명 조회하는 방법이 제한적이므로
+            # 일반적인 패턴을 기반으로 추정
+            etf_names = {
+                '069500': 'KODEX 200',
+                '360750': 'TIGER 미국S&P500',
+                '114260': 'KODEX 국고채10년',
+                '133690': 'KODEX 나스닥100',
+                '195930': 'KODEX 선진국MSCI',
+                # 더 많은 ETF 이름 매핑 추가 가능
+            }
+            
+            return etf_names.get(ticker, f'ETF_{ticker}')
+            
+        except:
+            return f'ETF_{ticker}'
+    
+    def _classify_etf_category(self, ticker: str) -> str:
+        """ETF 카테고리 분류"""
+        # 티커 코드나 이름 패턴을 기반으로 카테고리 분류
+        category_patterns = {
+            'domestic_equity': ['069500', '229200', '148020'],  # 국내 주식
+            'foreign_equity': ['360750', '133690', '195930'],   # 해외 주식
+            'bonds': ['114260', '305080', '130730'],            # 채권
+            'alternatives': ['329200', '351590', '132030'],     # 대안투자
+            'thematic': ['305540', '091160'],                   # 테마
+        }
+        
+        for category, tickers in category_patterns.items():
+            if ticker in tickers:
+                return category
+        
+        # 기본값
+        return 'domestic_equity'
+    
+    def _get_default_etf_list(self) -> List[Dict]:
+        """기본 ETF 리스트 (pykrx 없을 때)"""
+        default_etfs = [
+            {
+                'code': '069500',
+                'name': 'KODEX 200',
+                'category': 'domestic_equity',
+                'market_price': 28400,
+                'aum': 20000,
+                'last_updated': datetime.now().isoformat()
+            },
+            {
+                'code': '360750',
+                'name': 'TIGER 미국S&P500',
+                'category': 'foreign_equity',
+                'market_price': 15800,
+                'aum': 25000,
+                'last_updated': datetime.now().isoformat()
+            },
+            # 더 많은 기본 ETF 추가...
+        ]
+        
+        logger.info(f"기본 ETF 리스트 반환: {len(default_etfs)}개")
+        return default_etfs
+    
+    def fetch_etf_price_data(self, ticker: str, period: str = "1m") -> pd.DataFrame:
+        """ETF 가격 데이터 조회"""
+        cache_key = self._get_cache_key("price", ticker, period)
+        cached_data = self._get_cache(cache_key)
+        if cached_data is not None:
+            return cached_data
+        
+        if not PYKRX_AVAILABLE:
+            logger.warning(f"pykrx 없음 - {ticker} 더미 데이터 반환")
+            return self._generate_dummy_price_data(ticker, period)
+        
+        try:
+            # 기간 계산
+            end_date = datetime.now()
+            
+            if period == "1d":
+                start_date = end_date - timedelta(days=1)
+            elif period == "1w":
+                start_date = end_date - timedelta(days=7)
+            elif period == "1m":
+                start_date = end_date - timedelta(days=30)
+            elif period == "3m":
+                start_date = end_date - timedelta(days=90)
+            elif period == "1y":
+                start_date = end_date - timedelta(days=365)
+            else:
+                start_date = end_date - timedelta(days=30)
+            
+            # 영업일로 조정
+            start_date_str = self.get_last_business_day(start_date)
+            end_date_str = self.get_last_business_day(end_date)
+            
+            logger.info(f"ETF {ticker} 가격 데이터 조회: {start_date_str} ~ {end_date_str}")
+            
+            self._rate_limit()
+            
+            # pykrx로 OHLCV 데이터 조회
+            df = stock.get_market_ohlcv_by_date(start_date_str, end_date_str, ticker)
+            
+            if df.empty:
+                logger.warning(f"ETF {ticker} 가격 데이터 없음")
+                return pd.DataFrame()
+            
+            # 컬럼명 영어로 변경
+            df.columns = ['open', 'high', 'low', 'close', 'volume']
+            df.index.name = 'date'
+            df = df.reset_index()
+            
+            # 날짜 형식 변환
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # 수익률 계산
+            df['returns'] = df['close'].pct_change()
+            
+            logger.info(f"ETF {ticker} 가격 데이터 조회 완료: {len(df)}건")
+            
+            # 캐시에 저장
+            self._set_cache(cache_key, df)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"ETF {ticker} 가격 데이터 조회 실패: {e}")
+            return self._generate_dummy_price_data(ticker, period)
+    
+    def _generate_dummy_price_data(self, ticker: str, period: str) -> pd.DataFrame:
+        """더미 가격 데이터 생성"""
+        # 기간에 따른 데이터 포인트 수
+        period_days = {
+            "1d": 1,
+            "1w": 7,
+            "1m": 30,
+            "3m": 90,
+            "1y": 365
+        }
+        
+        days = period_days.get(period, 30)
+        
+        # 기본 가격 설정
+        base_prices = {
+            '069500': 28400,
+            '360750': 15800,
+            '114260': 108500,
+        }
+        
+        base_price = base_prices.get(ticker, 10000)
+        
+        # 더미 데이터 생성
+        dates = pd.date_range(end=datetime.now(), periods=days, freq='D')
+        
+        # 랜덤 가격 변동 (시드 고정으로 일관성 유지)
+        np.random.seed(hash(ticker) % 1000)
+        returns = np.random.normal(0.001, 0.02, days)  # 평균 0.1%, 변동성 2%
+        
+        prices = [base_price]
+        for r in returns[1:]:
+            prices.append(prices[-1] * (1 + r))
+        
+        # DataFrame 생성
+        df = pd.DataFrame({
+            'date': dates,
+            'open': prices,
+            'high': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
+            'low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
+            'close': prices,
+            'volume': np.random.randint(10000, 100000, days),
+            'returns': [0] + returns[1:].tolist()
+        })
+        
+        return df
+    
+    def calculate_performance_metrics(self, price_data: pd.DataFrame) -> Dict:
+        """성과 지표 계산"""
+        if price_data.empty:
+            return {'data_points': 0}
+        
+        try:
+            returns = price_data['returns'].dropna()
+            
+            if len(returns) == 0:
+                return {'data_points': len(price_data)}
+            
+            # 기본 성과 지표 계산
+            metrics = {
+                'data_points': len(price_data),
+                'total_return': (price_data['close'].iloc[-1] / price_data['close'].iloc[0] - 1) * 100,
+                'volatility': returns.std() * np.sqrt(252) * 100,  # 연환산 변동성
+                'sharpe_ratio': (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0,
+                'max_drawdown': self._calculate_max_drawdown(price_data['close']),
+                'avg_volume': price_data['volume'].mean(),
+                'current_price': price_data['close'].iloc[-1]
+            }
+            
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"성과 지표 계산 실패: {e}")
+            return {'data_points': len(price_data)}
+    
+    def _calculate_max_drawdown(self, prices: pd.Series) -> float:
+        """최대 낙폭 계산"""
+        try:
+            cumulative = (1 + prices.pct_change()).cumprod()
+            running_max = cumulative.expanding().max()
+            drawdown = (cumulative - running_max) / running_max
+            return abs(drawdown.min()) * 100
+        except:
+            return 0.0
+    
+    def fetch_etf_info(self, ticker: str) -> Dict:
+        """ETF 추가 정보 조회"""
+        cache_key = self._get_cache_key("info", ticker)
+        cached_data = self._get_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
+        try:
+            last_business_day = self.get_last_business_day()
+            
+            info = {
+                'ticker': ticker,
+                'current_price': 0,
+                'nav': 0,
+                'premium_discount': 0,
+                'volume': 0,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            if PYKRX_AVAILABLE:
+                try:
+                    self._rate_limit()
+                    
+                    # 최신 가격 정보
+                    price_data = stock.get_market_ohlcv_by_date(last_business_day, last_business_day, ticker)
+                    if not price_data.empty:
+                        info['current_price'] = float(price_data.iloc[-1]['종가'])
+                        info['volume'] = int(price_data.iloc[-1]['거래량'])
+                    
+                    # ETF 특화 정보 (가능한 경우)
+                    try:
+                        # ETF NAV 정보는 별도 API가 필요할 수 있음
+                        info['nav'] = info['current_price']  # 임시로 현재가 사용
+                        info['premium_discount'] = 0  # 계산 필요
+                    except:
+                        pass
+                        
+                except Exception as e:
+                    logger.debug(f"ETF {ticker} 정보 조회 실패: {e}")
+            
+            # 캐시에 저장
+            self._set_cache(cache_key, info)
+            
+            return info
+            
+        except Exception as e:
+            logger.error(f"ETF {ticker} 정보 조회 실패: {e}")
+            return {
+                'ticker': ticker,
+                'current_price': 10000,
+                'nav': 10000,
+                'premium_discount': 0,
+                'volume': 0,
+                'last_updated': datetime.now().isoformat()
+            }
+    
+    def update_etf_database(self, etf_list: List[Dict]) -> bool:
+        """ETF 정보를 데이터베이스에 업데이트"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            # 테이블 존재 확인 및 생성
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS etf_info (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    market_price REAL DEFAULT 0,
+                    aum REAL DEFAULT 0,
+                    volume INTEGER DEFAULT 0,
+                    last_updated TEXT
+                )
+            ''')
+            
+            updated_count = 0
+            
+            for etf in etf_list:
+                conn.execute('''
+                    INSERT OR REPLACE INTO etf_info 
+                    (code, name, category, market_price, aum, volume, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    etf['code'],
+                    etf['name'],
+                    etf.get('category', 'unknown'),
+                    etf.get('market_price', 0),
+                    etf.get('aum', 0),
+                    etf.get('volume', 0),
+                    etf['last_updated']
+                ))
+                updated_count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"ETF 데이터베이스 업데이트 완료: {updated_count}개")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ETF 데이터베이스 업데이트 실패: {e}")
+            return False
+    
+    def get_market_status(self) -> Dict:
+        """시장 상태 정보"""
+        now = datetime.now()
+        last_business_day = self.get_last_business_day()
+        
+        # 시장 시간 체크 (한국 시장: 09:00-15:30)
+        market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        is_trading_hours = market_open <= now <= market_close and now.weekday() < 5
+        
+        return {
+            'current_time': now.isoformat(),
+            'last_business_day': last_business_day,
+            'is_trading_hours': is_trading_hours,
+            'market_open': market_open.time().isoformat(),
+            'market_close': market_close.time().isoformat(),
+            'is_weekend': now.weekday() >= 5,
+            'pykrx_available': PYKRX_AVAILABLE
+        }
+
+
+# ==========================================
+# 실행 예제 및 테스트 코드
+# ==========================================
+
+if __name__ == "__main__":
+    print("📊 pykrx 기반 시장 데이터 수집기 테스트")
+    print("=" * 60)
+    
+    # 수집기 초기화
+    collector = MarketDataCollector()
+    
+    # 시장 상태 확인
+    print("\n📈 시장 상태:")
+    market_status = collector.get_market_status()
+    print(f"현재 시간: {market_status['current_time'][:19]}")
+    print(f"최종 영업일: {market_status['last_business_day']}")
+    print(f"거래 시간: {'예' if market_status['is_trading_hours'] else '아니오'}")
+    print(f"주말: {'예' if market_status['is_weekend'] else '아니오'}")
+    print(f"pykrx 사용 가능: {'예' if market_status['pykrx_available'] else '아니오'}")
+    
+    # ETF 리스트 조회 테스트
+    print(f"\n📋 ETF 리스트 조회 테스트:")
+    etf_list = collector.get_all_etf_list()
+    print(f"총 ETF 개수: {len(etf_list)}")
+    
+    if etf_list:
+        print(f"\n상위 5개 ETF:")
+        for i, etf in enumerate(etf_list[:5]):
+            print(f"{i+1}. {etf['name']} ({etf['code']}): {etf['market_price']:,.0f}원")
+    
+    # 개별 ETF 가격 데이터 테스트
+    if etf_list:
+        test_ticker = etf_list[0]['code']
+        print(f"\n📊 {test_ticker} 가격 데이터 테스트:")
+        
+        price_data = collector.fetch_etf_price_data(test_ticker, "1m")
+        if not price_data.empty:
+            print(f"데이터 기간: {price_data['date'].min().date()} ~ {price_data['date'].max().date()}")
+            print(f"데이터 포인트: {len(price_data)}개")
+            print(f"최신 가격: {price_data['close'].iloc[-1]:,.0f}원")
+            
+            # 성과 지표 계산
+            metrics = collector.calculate_performance_metrics(price_data)
+            print(f"총 수익률: {metrics.get('total_return', 0):.2f}%")
+            print(f"변동성: {metrics.get('volatility', 0):.2f}%")
+        else:
+            print("가격 데이터 없음")
+    
+    print(f"\n✅ 시장 데이터 수집기 테스트 완료!")

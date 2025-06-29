@@ -1,0 +1,636 @@
+# ==========================================
+# main.py - ETF 시스템 통합 런처
+# ==========================================
+
+import sys
+import os
+import time
+import argparse
+from datetime import datetime
+
+# 프로젝트 모듈 import (오류 처리 포함)
+modules_loaded = {}
+
+# UpdateManager import 시도
+try:
+    from core.update_manager import UpdateManager
+    modules_loaded['UpdateManager'] = True
+    print("✅ UpdateManager 모듈 import 성공")
+except ImportError:
+    try:
+        from core.update_manager import ETFUpdateManager as UpdateManager
+        modules_loaded['UpdateManager'] = True
+        print("✅ ETFUpdateManager 모듈 import 성공")
+    except ImportError:
+        modules_loaded['UpdateManager'] = False
+        print("⚠️ UpdateManager 모듈을 찾을 수 없습니다")
+        
+        class DummyUpdateManager:
+            """더미 업데이트 관리자"""
+            def batch_update_all_etfs(self, max_etfs=None, delay_between_updates=1.0):
+                print(f"🔄 더미 업데이트 실행 (최대 {max_etfs}개 ETF)")
+                time.sleep(2)  # 시뮬레이션
+                
+                class Summary:
+                    total_etfs = max_etfs or 100
+                    successful_updates = int(0.8 * (max_etfs or 100))
+                    failed_updates = int(0.2 * (max_etfs or 100))
+                    success_rate = 80.0
+                    total_duration = 2.0 * 60  # 2분
+                
+                return Summary()
+            
+            def get_system_status(self):
+                return {
+                    'total_etfs': 100,
+                    'updated_etfs': 80,
+                    'price_available': 75,
+                    'recent_updates_24h': 50,
+                    'health_score': 85.0,
+                    'status': 'healthy'
+                }
+            
+            def get_current_status(self):
+                return {
+                    'is_updating': False,
+                    'progress': 100.0,
+                    'last_update': '2024-12-22 18:00:00'
+                }
+            
+            def get_update_history(self, limit=3):
+                return [
+                    {
+                        'start_time': '2024-12-22 18:00:00',
+                        'success_rate': 85.0,
+                        'successful_updates': 85,
+                        'total_etfs': 100
+                    },
+                    {
+                        'start_time': '2024-12-21 18:00:00',
+                        'success_rate': 90.0,
+                        'successful_updates': 90,
+                        'total_etfs': 100
+                    }
+                ]
+        
+        UpdateManager = DummyUpdateManager
+
+# Scheduler import 시도
+try:
+    from core.scheduler import Scheduler
+    modules_loaded['Scheduler'] = True
+    print("✅ Scheduler 모듈 import 성공")
+except ImportError:
+    try:
+        from core.scheduler import ETFScheduler as Scheduler
+        modules_loaded['Scheduler'] = True
+        print("✅ ETFScheduler 모듈 import 성공")
+    except ImportError:
+        modules_loaded['Scheduler'] = False
+        print("⚠️ Scheduler 모듈을 찾을 수 없습니다")
+        
+        class DummyScheduler:
+            """더미 스케줄러"""
+            def __init__(self):
+                self.is_running = False
+            
+            def start(self):
+                self.is_running = True
+                print("🚀 더미 스케줄러 시작")
+                return True
+            
+            def stop(self):
+                self.is_running = False
+                print("🛑 더미 스케줄러 중지")
+                return True
+        
+        Scheduler = DummyScheduler
+
+# ETFUniverse import 시도
+try:
+    from data.etf_universe import ETFUniverse
+    modules_loaded['ETFUniverse'] = True
+    print("✅ ETFUniverse 모듈 import 성공")
+except ImportError:
+    modules_loaded['ETFUniverse'] = False
+    print("⚠️ ETFUniverse 모듈을 찾을 수 없습니다")
+    
+    class DummyETFUniverse:
+        """더미 ETF 유니버스"""
+        def __init__(self):
+            print("📊 더미 ETF 유니버스 초기화")
+    
+    ETFUniverse = DummyETFUniverse
+
+# PortfolioManager import 시도
+try:
+    from core.portfolio_manager import PortfolioManager
+    modules_loaded['PortfolioManager'] = True
+    print("✅ PortfolioManager 모듈 import 성공")
+except ImportError:
+    modules_loaded['PortfolioManager'] = False
+    print("⚠️ PortfolioManager 모듈을 찾을 수 없습니다")
+    
+    class DummyPortfolioManager:
+        """더미 포트폴리오 관리자"""
+        def __init__(self, database_manager=None, **kwargs):
+            self.db_manager = database_manager
+            print("💼 더미 포트폴리오 관리자 초기화")
+            
+        def set_database_manager(self, db_manager):
+            self.db_manager = db_manager
+    
+    PortfolioManager = DummyPortfolioManager
+
+# DatabaseManager import 시도
+try:
+    from data.database_manager import DatabaseManager
+    modules_loaded['DatabaseManager'] = True
+    print("✅ DatabaseManager 모듈 import 성공")
+except ImportError:
+    modules_loaded['DatabaseManager'] = False
+    print("⚠️ DatabaseManager 모듈을 찾을 수 없습니다")
+    
+    class DummyDatabaseManager:
+        """더미 데이터베이스 관리자"""
+        def __init__(self):
+            print("🗄️ 더미 데이터베이스 관리자 초기화")
+    
+    DatabaseManager = DummyDatabaseManager
+
+print(f"📋 모듈 로드 상태: {sum(modules_loaded.values())}/{len(modules_loaded)}개 성공")
+
+class ETFSystemLauncher:
+    """ETF 시스템 통합 런처"""
+    
+    def __init__(self):
+        self.update_manager = None
+        self.scheduler = None
+        self.portfolio_manager = None
+        self.db_manager = None
+        
+    def initialize_system(self):
+        """시스템 초기화"""
+        print("🏗️ ETF 시스템 초기화 중...")
+        
+        try:
+            # ETF 유니버스 초기화
+            print("📊 ETF 유니버스 구축 중...")
+            universe = ETFUniverse()
+            print("✅ ETF 유니버스 구축 완료")
+            
+            # 데이터베이스 관리자 초기화
+            print("🗄️ 데이터베이스 관리자 초기화 중...")
+            self.db_manager = DatabaseManager()
+            print("✅ 데이터베이스 관리자 초기화 완료")
+            
+            # 포트폴리오 관리자 초기화
+            print("💼 포트폴리오 관리자 초기화 중...")
+            try:
+                # database_manager 인수와 함께 시도
+                self.portfolio_manager = PortfolioManager(database_manager=self.db_manager)
+            except TypeError:
+                # database_manager 인수 없이 시도
+                self.portfolio_manager = PortfolioManager()
+                # 필요하면 나중에 database_manager 설정
+                if hasattr(self.portfolio_manager, 'set_database_manager'):
+                    self.portfolio_manager.set_database_manager(self.db_manager)
+                elif hasattr(self.portfolio_manager, 'db_manager'):
+                    self.portfolio_manager.db_manager = self.db_manager
+            print("✅ 포트폴리오 관리자 초기화 완료")
+            
+            # 업데이트 관리자 초기화
+            print("🔄 업데이트 관리자 초기화 중...")
+            self.update_manager = UpdateManager()
+            print("✅ 업데이트 관리자 초기화 완료")
+            
+            # 스케줄러 초기화
+            print("📅 스케줄러 초기화 중...")
+            self.scheduler = Scheduler()
+            print("✅ 스케줄러 초기화 완료")
+            
+            print("🎉 시스템 초기화 완료!")
+            
+            # 모듈 상태 요약
+            print(f"\n📋 사용 중인 모듈:")
+            for module, loaded in modules_loaded.items():
+                status = "✅ 실제" if loaded else "⚠️ 더미"
+                print(f"   - {module}: {status}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 시스템 초기화 실패: {e}")
+            return False
+    
+    def run_full_update(self, max_etfs=None, delay=1.0):
+        """전체 ETF 업데이트 실행"""
+        print("\n🚀 전체 ETF 업데이트 시작")
+        print("=" * 60)
+        
+        if not self.update_manager:
+            print("❌ 업데이트 관리자가 초기화되지 않았습니다")
+            return False
+        
+        try:
+            # 시스템 상태 체크
+            health = self.update_manager.get_system_status()
+            print(f"📊 시스템 상태: {health.get('status', 'unknown')} ({health.get('health_score', 0):.1f}%)")
+            
+            # 업데이트 실행
+            summary = self.update_manager.batch_update_all_etfs(
+                max_etfs=max_etfs,
+                delay_between_updates=delay
+            )
+            
+            if summary:
+                print(f"\n🎯 업데이트 완료 요약:")
+                print(f"- 대상 ETF: {summary.total_etfs}개")
+                print(f"- 성공: {summary.successful_updates}개")
+                print(f"- 실패: {summary.failed_updates}개")
+                print(f"- 성공률: {summary.success_rate:.1f}%")
+                print(f"- 소요시간: {summary.total_duration/60:.1f}분")
+                return True
+            else:
+                print("❌ 업데이트 실행 실패")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 업데이트 중 오류: {e}")
+            return False
+    
+    def run_scheduler(self):
+        """스케줄러 실행"""
+        print("\n📅 ETF 스케줄러 시작")
+        print("=" * 60)
+        
+        if not self.scheduler:
+            print("❌ 스케줄러가 초기화되지 않았습니다")
+            return False
+        
+        try:
+            success = self.scheduler.start()
+            
+            if success:
+                print("⏰ 스케줄러가 백그라운드에서 실행 중입니다")
+                print("Ctrl+C로 중지할 수 있습니다")
+                
+                # 무한 대기 (사용자 중단 시까지)
+                try:
+                    while True:
+                        time.sleep(60)
+                        current_time = datetime.now().strftime("%H:%M:%S")
+                        print(f"[{current_time}] 스케줄러 실행 중... (Ctrl+C로 중지)")
+                
+                except KeyboardInterrupt:
+                    print("\n🛑 사용자에 의해 중지됨")
+                    self.scheduler.stop()
+                    return True
+            else:
+                print("❌ 스케줄러 시작 실패")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 스케줄러 실행 실패: {e}")
+            return False
+    
+    def run_dashboard(self, mode="auto"):
+        """대시보드 실행"""
+        print("\n📊 ETF 모니터링 대시보드 시작")
+        print("=" * 60)
+        
+        try:
+            if mode == "web":
+                print("🌐 웹 대시보드 시작...")
+                self._run_streamlit_dashboard()
+            elif mode == "cli":
+                print("💻 CLI 대시보드 시작...")
+                self._run_cli_dashboard()
+            else:
+                # 자동 선택
+                try:
+                    import streamlit
+                    print("🌐 Streamlit이 사용 가능하므로 웹 대시보드를 시작합니다...")
+                    print("브라우저에서 http://localhost:8501 으로 접속하세요")
+                    self._run_streamlit_dashboard()
+                except ImportError:
+                    print("💻 Streamlit이 없으므로 CLI 대시보드를 시작합니다...")
+                    self._run_cli_dashboard()
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 대시보드 실행 실패: {e}")
+            return False
+
+    def _run_streamlit_dashboard(self):
+        """Streamlit 대시보드 실행"""
+        import subprocess
+        import sys
+        
+        # Streamlit 앱 실행
+        dashboard_path = "web/dashboard.py"
+        
+        # 파일이 없으면 간단한 더미 대시보드 생성
+        if not os.path.exists(dashboard_path):
+            os.makedirs("web", exist_ok=True)
+            dummy_dashboard = '''
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+
+st.title("🎯 ETF 포트폴리오 관리 대시보드")
+st.sidebar.title("📋 메뉴")
+
+# 더미 데이터
+data = {
+    "ETF": ["KODEX 200", "TIGER 미국S&P500", "KODEX 국고채10년"],
+    "수익률": [5.2, 8.1, 2.3],
+    "보유비중": [40, 35, 25]
+}
+df = pd.DataFrame(data)
+
+# 메인 대시보드
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("총 자산", "₩50,000,000", "5.2%")
+with col2:
+    st.metric("총 수익률", "8.5%", "1.2%")
+with col3:
+    st.metric("ETF 개수", "3개", "0")
+
+# 차트
+fig = px.pie(df, values="보유비중", names="ETF", title="자산 배분")
+st.plotly_chart(fig)
+
+# 수익률 차트
+fig2 = px.bar(df, x="ETF", y="수익률", title="ETF별 수익률")
+st.plotly_chart(fig2)
+
+st.info("💡 이것은 더미 대시보드입니다. 실제 데이터는 시스템 구축 후 표시됩니다.")
+'''
+            with open(dashboard_path, 'w', encoding='utf-8') as f:
+                f.write(dummy_dashboard)
+            print(f"📝 더미 대시보드 생성: {dashboard_path}")
+        
+        cmd = [sys.executable, "-m", "streamlit", "run", dashboard_path]
+        
+        try:
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\n🛑 대시보드 중지됨")
+        except Exception as e:
+            print(f"❌ 대시보드 실행 실패: {e}")
+    
+    def _run_cli_dashboard(self):
+        """CLI 대시보드 실행"""
+        print("💻 CLI 대시보드 모드")
+        print("=" * 40)
+        
+        while True:
+            try:
+                print("\n📊 대시보드 메뉴:")
+                print("1. 포트폴리오 현황")
+                print("2. ETF 가격 조회") 
+                print("3. 시스템 상태")
+                print("4. 돌아가기")
+                
+                choice = input("\n선택 (1-4): ").strip()
+                
+                if choice == "1":
+                    print("\n💼 포트폴리오 현황")
+                    print("📊 더미 데이터:")
+                    print("- 총 자산: ₩50,000,000")
+                    print("- 총 수익률: 8.5%")
+                    print("- KODEX 200: 40% (₩20,000,000)")
+                    print("- TIGER 미국S&P500: 35% (₩17,500,000)")
+                    print("- KODEX 국고채10년: 25% (₩12,500,000)")
+                
+                elif choice == "2":
+                    etf_code = input("ETF 코드 입력 (예: 069500): ").strip()
+                    if etf_code:
+                        print(f"\n📈 {etf_code} 정보 (더미 데이터)")
+                        print("- 현재가: ₩10,500")
+                        print("- 전일 대비: +1.2% (+125원)")
+                        print("- 거래량: 1,234,567주")
+                        print("- 52주 최고가: ₩11,200")
+                        print("- 52주 최저가: ₩9,800")
+                    
+                elif choice == "3":
+                    self.system_status()
+                
+                elif choice == "4":
+                    break
+                    
+                else:
+                    print("❌ 1-4 중에서 선택해주세요")
+                    
+            except KeyboardInterrupt:
+                print("\n🛑 CLI 대시보드 종료")
+                break
+
+    def system_status(self):
+        """시스템 상태 확인"""
+        print("\n🔍 시스템 상태 확인")
+        print("=" * 60)
+        
+        if not self.update_manager:
+            print("❌ 업데이트 관리자가 초기화되지 않았습니다")
+            return False
+        
+        try:
+            # 시스템 건강 상태
+            health = self.update_manager.get_system_status()
+            
+            print("📊 시스템 건강 상태:")
+            print(f"- 총 ETF: {health.get('total_etfs', 0)}개")
+            print(f"- 업데이트된 ETF: {health.get('updated_etfs', 0)}개")
+            print(f"- 가격 정보 보유: {health.get('price_available', 0)}개")
+            print(f"- 24시간 내 업데이트: {health.get('recent_updates_24h', 0)}개")
+            print(f"- 건강 점수: {health.get('health_score', 0):.1f}%")
+            print(f"- 상태: {health.get('status', 'unknown')}")
+            
+            # 업데이트 상태
+            status = self.update_manager.get_current_status()
+            print(f"\n🔄 업데이트 상태:")
+            print(f"- 진행 중: {'예' if status.get('is_updating') else '아니오'}")
+            print(f"- 진행률: {status.get('progress', 0):.1f}%")
+            print(f"- 마지막 업데이트: {status.get('last_update', '알 수 없음')}")
+            
+            # 최근 히스토리
+            history = self.update_manager.get_update_history(3)
+            if history:
+                print(f"\n📋 최근 업데이트 히스토리:")
+                for i, record in enumerate(history):
+                    print(f"{i+1}. {record['start_time'][:19]} - "
+                          f"성공률 {record['success_rate']:.1f}% "
+                          f"({record['successful_updates']}/{record['total_etfs']})")
+            
+            # 모듈 상태
+            print(f"\n🔧 모듈 상태:")
+            for module, loaded in modules_loaded.items():
+                status_text = "✅ 정상" if loaded else "⚠️ 더미"
+                print(f"- {module}: {status_text}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 상태 확인 실패: {e}")
+            return False
+    
+    def interactive_menu(self):
+        """대화형 메뉴"""
+        print("\n🎯 ETF 시스템 대화형 메뉴")
+        print("=" * 60)
+        
+        while True:
+            try:
+                print("\n📋 메뉴 선택:")
+                print("1. 시스템 상태 확인")
+                print("2. 빠른 업데이트 (10개 ETF)")
+                print("3. 전체 업데이트")
+                print("4. 스케줄러 시작")
+                print("5. 대시보드 실행")
+                print("6. 종료")
+                
+                choice = input("\n선택 (1-6): ").strip()
+                
+                if choice == "1":
+                    self.system_status()
+                
+                elif choice == "2":
+                    print("\n⚡ 빠른 업데이트 실행...")
+                    self.run_full_update(max_etfs=10, delay=0.5)
+                
+                elif choice == "3":
+                    confirm = input("\n전체 업데이트는 시간이 오래 걸립니다. 계속하시겠습니까? (y/N): ")
+                    if confirm.lower() == 'y':
+                        self.run_full_update()
+                    else:
+                        print("전체 업데이트 취소됨")
+                
+                elif choice == "4":
+                    self.run_scheduler()
+                
+                elif choice == "5":
+                    dashboard_mode = input("대시보드 모드 선택 (web/cli/auto): ").strip().lower()
+                    if dashboard_mode in ['web', 'cli', 'auto']:
+                        self.run_dashboard(dashboard_mode)
+                    else:
+                        self.run_dashboard('auto')
+                
+                elif choice == "6":
+                    print("👋 시스템을 종료합니다")
+                    break
+                
+                else:
+                    print("❌ 1-6 중에서 선택해주세요")
+            
+            except KeyboardInterrupt:
+                print("\n\n👋 사용자에 의해 종료됨")
+                break
+            except Exception as e:
+                print(f"\n❌ 오류 발생: {e}")
+
+
+def main():
+    """메인 실행 함수"""
+    parser = argparse.ArgumentParser(description="ETF 장기투자 관리 시스템")
+    parser.add_argument("--mode", choices=["update", "scheduler", "dashboard", "status", "interactive"], 
+                       default="interactive", help="실행 모드 선택")
+    parser.add_argument("--max-etfs", type=int, help="업데이트할 최대 ETF 개수")
+    parser.add_argument("--delay", type=float, default=1.0, help="업데이트 간 지연시간(초)")
+    parser.add_argument("--dashboard-mode", choices=["web", "cli", "auto"], default="auto", 
+                       help="대시보드 모드")
+    
+    args = parser.parse_args()
+    
+    print("🚀 ETF 장기투자 관리 시스템")
+    print("=" * 60)
+    print(f"⏰ 시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🎯 실행 모드: {args.mode}")
+    
+    # 시스템 런처 초기화
+    launcher = ETFSystemLauncher()
+    
+    # 시스템 초기화
+    if not launcher.initialize_system():
+        print("❌ 시스템 초기화 실패")
+        sys.exit(1)
+    
+    # 모드별 실행
+    try:
+        if args.mode == "update":
+            success = launcher.run_full_update(args.max_etfs, args.delay)
+            sys.exit(0 if success else 1)
+        
+        elif args.mode == "scheduler":
+            success = launcher.run_scheduler()
+            sys.exit(0 if success else 1)
+        
+        elif args.mode == "dashboard":
+            success = launcher.run_dashboard(args.dashboard_mode)
+            sys.exit(0 if success else 1)
+        
+        elif args.mode == "status":
+            success = launcher.system_status()
+            sys.exit(0 if success else 1)
+        
+        elif args.mode == "interactive":
+            launcher.interactive_menu()
+        
+        else:
+            print(f"❌ 알 수 없는 모드: {args.mode}")
+            sys.exit(1)
+    
+    except KeyboardInterrupt:
+        print("\n\n👋 사용자에 의해 중단됨")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ 실행 중 오류: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ==========================================
+# 사용 예제
+# ==========================================
+
+"""
+사용 방법:
+
+1. 대화형 메뉴 (기본):
+   python main.py
+
+2. 전체 ETF 업데이트:
+   python main.py --mode update
+
+3. 10개 ETF만 빠른 업데이트:
+   python main.py --mode update --max-etfs 10 --delay 0.5
+
+4. 스케줄러 시작:
+   python main.py --mode scheduler
+
+5. 웹 대시보드 시작:
+   python main.py --mode dashboard --dashboard-mode web
+
+6. CLI 대시보드 시작:
+   python main.py --mode dashboard --dashboard-mode cli
+
+7. 시스템 상태 확인:
+   python main.py --mode status
+
+필수 패키지:
+- pip install schedule (기본 스케줄러)
+
+선택적 패키지 (없어도 작동):
+- pip install apscheduler (고급 스케줄러)
+- pip install streamlit plotly (웹 대시보드)
+- pip install pykrx (실제 시장 데이터)
+
+⚠️ 모듈이 없으면 더미 버전으로 자동 대체됩니다.
+"""

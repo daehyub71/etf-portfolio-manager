@@ -1,0 +1,819 @@
+# ==========================================
+# core/update_manager.py - ETF 업데이트 관리자 (pykrx 연동 버전)
+# ==========================================
+
+import pandas as pd
+import numpy as np
+import sqlite3
+import time
+import json
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
+from dataclasses import dataclass, asdict
+import sys
+
+# 프로젝트 모듈 import
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# MarketDataCollector import 시도
+try:
+    from data.market_data_collector import MarketDataCollector
+    MARKET_DATA_AVAILABLE = True
+    print("✅ MarketDataCollector 사용 가능")
+except ImportError as e:
+    MARKET_DATA_AVAILABLE = False
+    print(f"⚠️ MarketDataCollector import 실패: {e}")
+    
+    # 더미 MarketDataCollector
+    class MarketDataCollector:
+        def __init__(self, db_path):
+            self.db_path = db_path
+            print(f"🔧 더미 MarketDataCollector 사용")
+        
+        def get_all_etf_list(self):
+            return [
+                {'code': '069500', 'name': 'KODEX 200', 'market_price': 28400},
+                {'code': '360750', 'name': 'TIGER 미국S&P500', 'market_price': 15800},
+                {'code': '114260', 'name': 'KODEX 국고채10년', 'market_price': 108500},
+            ]
+        
+        def fetch_etf_price_data(self, code, period="1m"):
+            import pandas as pd
+            import numpy as np
+            # 더미 가격 데이터 생성
+            dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
+            prices = np.random.normal(10000, 500, 30)
+            return pd.DataFrame({
+                'date': dates,
+                'close': prices,
+                'returns': np.random.normal(0, 0.02, 30)
+            })
+        
+        def calculate_performance_metrics(self, price_data):
+            return {'data_points': len(price_data), 'volatility': 15.0}
+        
+        def fetch_etf_info(self, code):
+            return {'current_price': 10000 + hash(code) % 5000, 'volume': 50000}
+        
+        def get_market_status(self):
+            return {
+                'last_business_day': '20241220',
+                'is_trading_hours': False,
+                'pykrx_available': False
+            }
+
+try:
+    from data.etf_universe import ETFUniverse
+    ETF_UNIVERSE_AVAILABLE = True
+except ImportError as e:
+    ETF_UNIVERSE_AVAILABLE = False
+    print(f"⚠️ ETFUniverse import 실패: {e}")
+
+@dataclass
+class UpdateResult:
+    """업데이트 결과 데이터 클래스"""
+    code: str
+    name: str
+    status: str  # 'success', 'failed', 'skipped'
+    error_message: str = ""
+    update_time: str = ""
+    data_points: int = 0
+    current_price: float = 0.0
+    price_change: float = 0.0
+
+@dataclass
+class BatchUpdateSummary:
+    """일괄 업데이트 요약"""
+    start_time: str
+    end_time: str
+    total_etfs: int
+    successful_updates: int
+    failed_updates: int
+    skipped_updates: int
+    success_rate: float
+    total_duration: float
+    results: List[UpdateResult]
+    errors: List[str]
+
+class ETFUpdateManager:
+    """ETF 데이터 전체 업데이트 관리자 (pykrx 연동 버전)"""
+    
+    def __init__(self, db_path: str = "etf_universe.db", log_level: str = "INFO"):
+        self.db_path = db_path
+        
+        # 로깅 설정
+        self.setup_logging(log_level)
+        self.logger = logging.getLogger(__name__)
+        
+        # 데이터베이스 초기화
+        self._initialize_database()
+        
+        # MarketDataCollector 초기화
+        self.collector = MarketDataCollector(db_path)
+        
+        # 업데이트 상태 추적
+        self.current_batch_id = None
+        self.is_updating = False
+        self.update_progress = 0
+        self.update_status = "idle"
+        
+        # 마지막 실제 데이터 로드 시도
+        self.last_real_data_attempt = None
+        self.use_real_data = MARKET_DATA_AVAILABLE
+        
+        self.logger.info("ETF 업데이트 관리자 초기화 완료")
+    
+    def setup_logging(self, level: str):
+        """로깅 설정"""
+        logger = logging.getLogger()
+        if not logger.handlers:
+            log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            
+            # 콘솔 핸들러
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(logging.Formatter(log_format))
+            logger.addHandler(console_handler)
+            
+            # 파일 핸들러 (옵션)
+            try:
+                file_handler = logging.FileHandler('etf_updates.log', encoding='utf-8')
+                file_handler.setFormatter(logging.Formatter(log_format))
+                logger.addHandler(file_handler)
+            except Exception as e:
+                print(f"파일 로깅 설정 실패: {e}")
+        
+        logger.setLevel(getattr(logging, level.upper()))
+    
+    def _initialize_database(self):
+        """데이터베이스 테이블 초기화"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # ETF 정보 테이블 생성 (pykrx 데이터 구조에 맞게)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS etf_info (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    subcategory TEXT,
+                    asset_class TEXT,
+                    region TEXT,
+                    currency TEXT DEFAULT 'KRW',
+                    expense_ratio REAL,
+                    aum REAL DEFAULT 0,
+                    market_price REAL DEFAULT 0,
+                    nav REAL DEFAULT 0,
+                    premium_discount REAL DEFAULT 0,
+                    dividend_yield REAL DEFAULT 0,
+                    tracking_error REAL DEFAULT 0,
+                    benchmark TEXT,
+                    fund_manager TEXT,
+                    inception_date TEXT,
+                    last_updated TEXT,
+                    avg_volume INTEGER DEFAULT 0,
+                    is_active BOOLEAN DEFAULT 1
+                )
+            ''')
+            
+            # ETF 가격 히스토리 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS etf_price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT,
+                    date TEXT,
+                    open_price REAL,
+                    high_price REAL,
+                    low_price REAL,
+                    close_price REAL,
+                    volume INTEGER,
+                    returns REAL,
+                    FOREIGN KEY (code) REFERENCES etf_info(code),
+                    UNIQUE(code, date)
+                )
+            ''')
+            
+            # 업데이트 히스토리 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS update_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time TEXT,
+                    end_time TEXT,
+                    total_etfs INTEGER,
+                    successful_updates INTEGER,
+                    failed_updates INTEGER,
+                    success_rate REAL,
+                    total_duration REAL,
+                    update_source TEXT,  -- 'pykrx' or 'dummy'
+                    market_status TEXT,  -- JSON
+                    summary_json TEXT
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"데이터베이스 초기화 완료: {self.db_path}")
+            
+        except Exception as e:
+            print(f"데이터베이스 초기화 실패: {e}")
+    
+    def refresh_etf_universe(self) -> bool:
+        """ETF 유니버스 새로고침 (pykrx에서 최신 목록 가져오기)"""
+        try:
+            self.logger.info("ETF 유니버스 새로고침 시작")
+            
+            # 시장 상태 확인
+            market_status = self.collector.get_market_status()
+            self.logger.info(f"시장 상태: {market_status}")
+            
+            # 전체 ETF 리스트 가져오기
+            etf_list = self.collector.get_all_etf_list()
+            
+            if not etf_list:
+                self.logger.warning("ETF 리스트가 비어있습니다")
+                return False
+            
+            # 데이터베이스에 저장
+            success = self._save_etf_universe_to_db(etf_list, market_status)
+            
+            if success:
+                self.logger.info(f"ETF 유니버스 새로고침 완료: {len(etf_list)}개")
+                return True
+            else:
+                self.logger.error("ETF 유니버스 데이터베이스 저장 실패")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"ETF 유니버스 새로고침 실패: {e}")
+            return False
+    
+    def _save_etf_universe_to_db(self, etf_list: List[Dict], market_status: Dict) -> bool:
+        """ETF 유니버스를 데이터베이스에 저장"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            saved_count = 0
+            
+            for etf in etf_list:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO etf_info 
+                        (code, name, category, market_price, aum, avg_volume, last_updated, is_active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        etf['code'],
+                        etf['name'],
+                        etf.get('category', 'unknown'),
+                        etf.get('market_price', 0),
+                        etf.get('aum', 0),
+                        etf.get('volume', 0),
+                        etf.get('last_updated', datetime.now().isoformat()),
+                        1  # is_active
+                    ))
+                    saved_count += 1
+                    
+                except Exception as e:
+                    self.logger.warning(f"ETF {etf.get('code', 'unknown')} 저장 실패: {e}")
+                    continue
+            
+            # 시장 상태 정보도 별도 테이블에 저장 (선택적)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS market_status_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    status_json TEXT
+                )
+            ''')
+            
+            cursor.execute('''
+                INSERT INTO market_status_log (timestamp, status_json)
+                VALUES (?, ?)
+            ''', (datetime.now().isoformat(), json.dumps(market_status)))
+            
+            conn.commit()
+            conn.close()
+            
+            self.logger.info(f"ETF 유니버스 저장 완료: {saved_count}개")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"ETF 유니버스 저장 실패: {e}")
+            return False
+    
+    def get_etf_list_from_db(self) -> List[Tuple[str, str]]:
+        """데이터베이스에서 ETF 리스트 조회"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            # 활성 ETF만 조회, AUM이 큰 순서로
+            query = '''
+                SELECT code, name FROM etf_info 
+                WHERE is_active = 1 
+                ORDER BY aum DESC, market_price DESC
+            '''
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if df.empty:
+                self.logger.warning("DB에서 ETF 리스트가 비어있음 - 유니버스 새로고침 시도")
+                
+                # ETF 유니버스 새로고침 시도
+                if self.refresh_etf_universe():
+                    # 다시 조회
+                    conn = sqlite3.connect(self.db_path)
+                    df = pd.read_sql_query(query, conn)
+                    conn.close()
+            
+            if not df.empty:
+                etf_list = list(zip(df['code'], df['name']))
+                self.logger.info(f"DB에서 ETF 리스트 조회: {len(etf_list)}개")
+                return etf_list
+            else:
+                # 기본 ETF 리스트 반환
+                return self._get_fallback_etf_list()
+                
+        except Exception as e:
+            self.logger.error(f"DB ETF 리스트 조회 실패: {e}")
+            return self._get_fallback_etf_list()
+    
+    def _get_fallback_etf_list(self) -> List[Tuple[str, str]]:
+        """기본 ETF 리스트 (fallback)"""
+        fallback_etfs = [
+            ('069500', 'KODEX 200'),
+            ('360750', 'TIGER 미국S&P500'),
+            ('114260', 'KODEX 국고채10년'),
+            ('133690', 'KODEX 나스닥100'),
+            ('195930', 'KODEX 선진국MSCI'),
+            ('229200', 'KODEX 코스닥150'),
+            ('305080', 'TIGER 미국채10년'),
+            ('132030', 'KODEX 골드선물'),
+            ('329200', 'KODEX 리츠'),
+            ('305540', 'KODEX 2차전지산업')
+        ]
+        
+        self.logger.info(f"기본 ETF 리스트 사용: {len(fallback_etfs)}개")
+        return fallback_etfs
+    
+    def update_single_etf(self, code: str, name: str, timeout: int = 30) -> UpdateResult:
+        """개별 ETF 업데이트 (pykrx 데이터 사용)"""
+        start_time = time.time()
+        
+        try:
+            self.logger.info(f"{code} ({name}) 업데이트 시작")
+            
+            # 1. 가격 데이터 수집
+            price_data = self.collector.fetch_etf_price_data(code, period="3m")
+            
+            if price_data.empty:
+                return UpdateResult(
+                    code=code,
+                    name=name,
+                    status="failed",
+                    error_message="가격 데이터 없음",
+                    update_time=datetime.now().isoformat()
+                )
+            
+            # 2. 성과 지표 계산
+            metrics = self.collector.calculate_performance_metrics(price_data)
+            
+            # 3. ETF 추가 정보 수집
+            etf_info = self.collector.fetch_etf_info(code)
+            
+            # 4. 데이터베이스 업데이트
+            success = self._update_database_with_real_data(code, price_data, metrics, etf_info)
+            
+            if success:
+                # 가격 변동 계산
+                if len(price_data) >= 2:
+                    current_price = price_data['close'].iloc[-1]
+                    prev_price = price_data['close'].iloc[-2]
+                    price_change = ((current_price - prev_price) / prev_price) * 100
+                else:
+                    price_change = 0
+                
+                result = UpdateResult(
+                    code=code,
+                    name=name,
+                    status="success",
+                    update_time=datetime.now().isoformat(),
+                    data_points=metrics.get('data_points', len(price_data)),
+                    current_price=etf_info.get('current_price', 0),
+                    price_change=round(price_change, 2)
+                )
+                
+                duration = time.time() - start_time
+                self.logger.info(f"{code} 업데이트 성공 ({duration:.1f}초)")
+                return result
+            else:
+                return UpdateResult(
+                    code=code,
+                    name=name,
+                    status="failed",
+                    error_message="데이터베이스 업데이트 실패",
+                    update_time=datetime.now().isoformat()
+                )
+                
+        except Exception as e:
+            error_msg = str(e)[:100]
+            self.logger.error(f"{code} 업데이트 실패: {error_msg}")
+            
+            return UpdateResult(
+                code=code,
+                name=name,
+                status="failed",
+                error_message=error_msg,
+                update_time=datetime.now().isoformat()
+            )
+    
+    def _update_database_with_real_data(self, code: str, price_data: pd.DataFrame, 
+                                       metrics: dict, etf_info: dict) -> bool:
+        """실제 데이터로 데이터베이스 업데이트"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            current_time = datetime.now().isoformat()
+            
+            # ETF 기본 정보 업데이트
+            cursor.execute('''
+                UPDATE etf_info 
+                SET market_price = ?, nav = ?, avg_volume = ?, last_updated = ?
+                WHERE code = ?
+            ''', (
+                etf_info.get('current_price', 0),
+                etf_info.get('nav', 0),
+                etf_info.get('volume', 0),
+                current_time,
+                code
+            ))
+            
+            # 가격 히스토리 저장 (최근 데이터만)
+            if not price_data.empty:
+                # 최근 5일 데이터만 저장
+                recent_data = price_data.tail(5)
+                
+                for _, row in recent_data.iterrows():
+                    try:
+                        date_str = row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date'])[:10]
+                        
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO etf_price_history
+                            (code, date, close_price, volume, returns)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (
+                            code,
+                            date_str,
+                            row.get('close', 0),
+                            row.get('volume', 0),
+                            row.get('returns', 0)
+                        ))
+                    except Exception as e:
+                        self.logger.debug(f"가격 히스토리 저장 실패: {e}")
+                        continue
+            
+            conn.commit()
+            conn.close()
+            
+            self.logger.debug(f"ETF {code} 데이터베이스 업데이트 완료")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"ETF {code} 데이터베이스 업데이트 실패: {e}")
+            return False
+    
+    def batch_update_all_etfs(self, 
+                             max_etfs: int = None, 
+                             delay_between_updates: float = 1.0,
+                             max_failures: int = 10,
+                             force_refresh_universe: bool = False) -> BatchUpdateSummary:
+        """전체 ETF 일괄 업데이트 (pykrx 데이터 사용)"""
+        
+        if self.is_updating:
+            self.logger.warning("이미 업데이트가 진행 중입니다")
+            return None
+        
+        self.is_updating = True
+        self.update_status = "running"
+        start_time = datetime.now()
+        
+        try:
+            # 시장 상태 확인
+            market_status = self.collector.get_market_status()
+            self.logger.info(f"시장 상태: {market_status}")
+            
+            # ETF 유니버스 새로고침 (옵션)
+            if force_refresh_universe or self._should_refresh_universe():
+                self.logger.info("ETF 유니버스 새로고침 실행")
+                self.refresh_etf_universe()
+            
+            # ETF 리스트 조회
+            etf_list = self.get_etf_list_from_db()
+            
+            if max_etfs:
+                etf_list = etf_list[:max_etfs]
+            
+            total_etfs = len(etf_list)
+            self.logger.info(f"일괄 업데이트 시작: {total_etfs}개 ETF")
+            
+            print(f"\n{'='*60}")
+            print(f"📊 ETF 일괄 업데이트 시작 (pykrx 연동)")
+            print(f"대상 ETF: {total_etfs}개")
+            print(f"업데이트 간격: {delay_between_updates}초")
+            print(f"최대 실패 허용: {max_failures}개")
+            print(f"데이터 소스: {'pykrx (실제 데이터)' if MARKET_DATA_AVAILABLE else 'Dummy (시뮬레이션)'}")
+            print(f"최종 영업일: {market_status.get('last_business_day', 'Unknown')}")
+            print(f"{'='*60}\n")
+            
+            # 업데이트 실행
+            results = []
+            successful_count = 0
+            failed_count = 0
+            consecutive_failures = 0
+            
+            for i, (code, name) in enumerate(etf_list):
+                self.update_progress = (i / total_etfs) * 100
+                
+                print(f"[{i+1:3d}/{total_etfs}] {code} ({name}) 처리 중...")
+                
+                # 개별 ETF 업데이트
+                result = self.update_single_etf(code, name)
+                results.append(result)
+                
+                if result.status == "success":
+                    successful_count += 1
+                    consecutive_failures = 0
+                    price_info = f"{result.current_price:,.0f}원" if result.current_price > 0 else "가격정보없음"
+                    change_info = f"({result.price_change:+.2f}%)" if result.price_change != 0 else ""
+                    print(f"   ✅ 성공: {price_info} {change_info}")
+                else:
+                    failed_count += 1
+                    consecutive_failures += 1
+                    print(f"   ❌ 실패: {result.error_message}")
+                
+                # 연속 실패 체크
+                if consecutive_failures >= max_failures:
+                    self.logger.error(f"연속 {max_failures}회 실패로 업데이트 중단")
+                    break
+                
+                # 진행률 표시
+                if (i + 1) % 5 == 0 or (i + 1) == total_etfs:
+                    success_rate = (successful_count / (i + 1)) * 100
+                    print(f"   📊 진행률: {i+1}/{total_etfs} ({success_rate:.1f}% 성공)")
+                
+                # 지연
+                if i < len(etf_list) - 1:
+                    time.sleep(delay_between_updates)
+            
+            # 요약 생성
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            success_rate = (successful_count / len(results)) * 100 if results else 0
+            
+            summary = BatchUpdateSummary(
+                start_time=start_time.isoformat(),
+                end_time=end_time.isoformat(),
+                total_etfs=len(results),
+                successful_updates=successful_count,
+                failed_updates=failed_count,
+                skipped_updates=0,
+                success_rate=round(success_rate, 1),
+                total_duration=round(duration, 1),
+                results=results,
+                errors=[r.error_message for r in results if r.status == "failed" and r.error_message]
+            )
+            
+            # 결과 출력
+            print(f"\n{'='*60}")
+            print(f"📈 일괄 업데이트 완료!")
+            print(f"소요 시간: {duration/60:.1f}분")
+            print(f"성공: {successful_count}개")
+            print(f"실패: {failed_count}개")
+            print(f"성공률: {success_rate:.1f}%")
+            print(f"데이터 소스: {'pykrx (실제)' if MARKET_DATA_AVAILABLE else 'Dummy (시뮬레이션)'}")
+            print(f"{'='*60}")
+            
+            # 결과 저장
+            self.save_update_summary(summary, market_status)
+            
+            self.logger.info(f"일괄 업데이트 완료: {success_rate:.1f}% 성공")
+            return summary
+            
+        except Exception as e:
+            self.logger.error(f"일괄 업데이트 중 오류: {e}")
+            raise
+        finally:
+            self.is_updating = False
+            self.update_status = "idle"
+            self.update_progress = 0
+    
+    def _should_refresh_universe(self) -> bool:
+        """ETF 유니버스 새로고침이 필요한지 확인"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            # 마지막 업데이트 시간 확인
+            cursor = conn.execute('''
+                SELECT MAX(last_updated) as last_update 
+                FROM etf_info 
+                WHERE last_updated IS NOT NULL
+            ''')
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result or not result[0]:
+                return True  # 데이터가 없으면 새로고침
+            
+            last_update = datetime.fromisoformat(result[0])
+            hours_since_update = (datetime.now() - last_update).total_seconds() / 3600
+            
+            # 24시간 이상 지났으면 새로고침
+            return hours_since_update >= 24
+            
+        except Exception as e:
+            self.logger.warning(f"유니버스 새로고침 필요성 확인 실패: {e}")
+            return False
+    
+    def save_update_summary(self, summary: BatchUpdateSummary, market_status: Dict = None):
+        """업데이트 요약 저장 (시장 상태 포함)"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # 업데이트 소스 결정
+            update_source = 'pykrx' if MARKET_DATA_AVAILABLE else 'dummy'
+            
+            cursor.execute('''
+                INSERT INTO update_history 
+                (start_time, end_time, total_etfs, successful_updates, failed_updates, 
+                 success_rate, total_duration, update_source, market_status, summary_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                summary.start_time,
+                summary.end_time,
+                summary.total_etfs,
+                summary.successful_updates,
+                summary.failed_updates,
+                summary.success_rate,
+                summary.total_duration,
+                update_source,
+                json.dumps(market_status) if market_status else None,
+                json.dumps(asdict(summary), ensure_ascii=False, indent=2)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            self.logger.info("업데이트 요약 저장 완료")
+            
+        except Exception as e:
+            self.logger.error(f"업데이트 요약 저장 실패: {e}")
+    
+    def get_update_history(self, limit: int = 10) -> List[Dict]:
+        """업데이트 히스토리 조회"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            query = '''
+                SELECT * FROM update_history 
+                ORDER BY start_time DESC 
+                LIMIT ?
+            '''
+            df = pd.read_sql_query(query, conn, params=(limit,))
+            conn.close()
+            
+            return df.to_dict('records')
+            
+        except Exception as e:
+            self.logger.error(f"업데이트 히스토리 조회 실패: {e}")
+            return []
+    
+    def get_current_status(self) -> Dict:
+        """현재 업데이트 상태 조회"""
+        market_status = self.collector.get_market_status()
+        
+        return {
+            'is_updating': self.is_updating,
+            'status': self.update_status,
+            'progress': self.update_progress,
+            'last_update': self.get_last_update_time(),
+            'data_source': 'pykrx' if MARKET_DATA_AVAILABLE else 'dummy',
+            'market_status': market_status
+        }
+    
+    def get_last_update_time(self) -> str:
+        """마지막 업데이트 시간 조회"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            query = "SELECT MAX(last_updated) as last_update FROM etf_info"
+            result = pd.read_sql_query(query, conn).iloc[0]['last_update']
+            conn.close()
+            return result or "업데이트 기록 없음"
+        except:
+            return "업데이트 기록 없음"
+    
+    def quick_health_check(self) -> Dict:
+        """시스템 상태 체크 (pykrx 연동 상태 포함)"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            
+            # 기본 통계
+            stats = pd.read_sql_query('''
+                SELECT 
+                    COUNT(*) as total_etfs,
+                    COUNT(CASE WHEN last_updated IS NOT NULL THEN 1 END) as updated_etfs,
+                    COUNT(CASE WHEN market_price > 0 THEN 1 END) as price_available,
+                    COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_etfs
+                FROM etf_info
+            ''', conn).iloc[0]
+            
+            # 최근 업데이트
+            recent_updates = pd.read_sql_query('''
+                SELECT COUNT(*) as recent_count
+                FROM etf_info 
+                WHERE last_updated > datetime('now', '-1 day')
+            ''', conn).iloc[0]['recent_count']
+            
+            conn.close()
+            
+            health_score = (stats['updated_etfs'] / stats['total_etfs']) * 100 if stats['total_etfs'] > 0 else 0
+            
+            # 시장 상태 정보 추가
+            market_status = self.collector.get_market_status()
+            
+            return {
+                'total_etfs': int(stats['total_etfs']),
+                'updated_etfs': int(stats['updated_etfs']),
+                'price_available': int(stats['price_available']),
+                'active_etfs': int(stats['active_etfs']),
+                'recent_updates_24h': int(recent_updates),
+                'health_score': round(health_score, 1),
+                'status': 'healthy' if health_score > 80 else 'warning' if health_score > 50 else 'critical',
+                'data_source': 'pykrx' if MARKET_DATA_AVAILABLE else 'dummy',
+                'last_business_day': market_status.get('last_business_day'),
+                'is_trading_hours': market_status.get('is_trading_hours', False),
+                'pykrx_available': market_status.get('pykrx_available', False)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"시스템 상태 체크 실패: {e}")
+            return {'status': 'error', 'error': str(e), 'health_score': 0.0}
+
+
+# ==========================================
+# 실행 예제 및 테스트 코드
+# ==========================================
+
+if __name__ == "__main__":
+    print("📊 ETF 업데이트 관리자 테스트 (pykrx 연동 버전)")
+    print("=" * 60)
+    
+    # 업데이트 관리자 초기화
+    manager = ETFUpdateManager()
+    
+    # 1. 시스템 상태 체크
+    print("\n🏥 시스템 상태 체크:")
+    health = manager.quick_health_check()
+    if health.get('status') != 'error':
+        print(f"- 총 ETF: {health['total_etfs']}개")
+        print(f"- 활성 ETF: {health['active_etfs']}개")
+        print(f"- 업데이트된 ETF: {health['updated_etfs']}개")
+        print(f"- 가격 정보 보유: {health['price_available']}개")
+        print(f"- 24시간 내 업데이트: {health['recent_updates_24h']}개")
+        print(f"- 시스템 상태: {health['status']} ({health['health_score']:.1f}%)")
+        print(f"- 데이터 소스: {health['data_source']}")
+        print(f"- 최종 영업일: {health.get('last_business_day', 'Unknown')}")
+        print(f"- pykrx 사용 가능: {'예' if health.get('pykrx_available') else '아니오'}")
+    else:
+        print(f"❌ 상태 체크 실패: {health.get('error')}")
+    
+    # 2. ETF 유니버스 새로고침 테스트
+    print(f"\n🌐 ETF 유니버스 새로고침 테스트:")
+    if manager.refresh_etf_universe():
+        print("✅ ETF 유니버스 새로고침 성공")
+    else:
+        print("❌ ETF 유니버스 새로고침 실패")
+    
+    # 3. 소규모 업데이트 테스트
+    print(f"\n⚡ 소규모 업데이트 테스트 (3개 ETF):")
+    try:
+        summary = manager.batch_update_all_etfs(max_etfs=3, delay_between_updates=0.5)
+        if summary:
+            print(f"\n📊 요약:")
+            print(f"- 소요시간: {summary.total_duration:.1f}초")
+            print(f"- 성공률: {summary.success_rate:.1f}%")
+            print(f"- 성공: {summary.successful_updates}개")
+            print(f"- 실패: {summary.failed_updates}개")
+        else:
+            print("❌ 업데이트 실행 실패")
+    except Exception as e:
+        print(f"❌ 테스트 업데이트 오류: {e}")
+    
+    print(f"\n✅ ETF 업데이트 관리자 테스트 완료!")
+    print(f"\n💡 다음 단계:")
+    print(f"   - 전체 ETF 업데이트: manager.batch_update_all_etfs()")
+    print(f"   - 유니버스 강제 새로고침: manager.batch_update_all_etfs(force_refresh_universe=True)")
+    print(f"   - 대시보드에서 실시간 모니터링")

@@ -1,0 +1,35 @@
+{
+  "schedules": {
+    "daily_update": {
+      "enabled": true,
+      "time": "18:00",
+      "timezone": "Asia/Seoul",
+      "max_etfs": null,
+      "delay": 1.0
+    },
+    "weekly_full_update": {
+      "enabled": true,
+      "day": "sunday",
+      "time": "02:00",
+      "timezone": "Asia/Seoul",
+      "max_etfs": null,
+      "delay": 0.5
+    },
+    "quick_check": {
+      "enabled": true,
+      "interval_hours": 4,
+      "max_etfs": 10,
+      "delay": 0.3
+    }
+  },
+  "notifications": {
+    "email_enabled": false,
+    "slack_enabled": false,
+    "log_level": "INFO"
+  },
+  "safety": {
+    "max_consecutive_failures": 5,
+    "auto_disable_on_failure": true,
+    "health_check_interval": 1
+  }
+}

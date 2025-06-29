@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 데이터베이스 파일
+*.db
+*.sqlite3
+
+# 설정 파일 (민감한 정보 포함)
+config_local.yaml
+.env
+secrets.yaml
+
+# 로그 파일
+logs/
+*.log
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 백업 파일
+backups/
+*.bak
+
+# 임시 파일
+temp/
+tmp/
+.tmp/
+
+# OS 생성 파일
+.DS_Store
+Thumbs.db
+
+# 테스트 커버리지
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# 대용량 데이터 파일
+data/raw/
+data/processed/
+*.csv
+*.xlsx

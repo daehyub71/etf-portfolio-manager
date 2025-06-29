@@ -1,0 +1,712 @@
+"""
+ETF 유니버스 관리 모듈
+한국에서 거래 가능한 모든 ETF 정보를 체계적으로 관리
+"""
+
+import pandas as pd
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+import json
+
+logger = logging.getLogger(__name__)
+
+class ETFUniverse:
+    """ETF 유니버스 관리 클래스"""
+
+    def __init__(self, db_path=None, **kwargs):
+        """
+        ETF 유니버스 초기화
+        
+        Args:
+            db_path: 데이터베이스 경로 (선택적, 호환성을 위해 추가)
+            **kwargs: 기타 매개변수
+        """
+        self.db_path = db_path
+        self.etf_data = {}
+        self.categories = {}
+        self._initialize_etf_universe()
+        
+        # 데이터베이스 연동 지원
+        if db_path:
+            self._load_from_database()
+        
+        logger.info(f"ETF 유니버스 초기화 완료 (DB: {db_path if db_path else 'N/A'})")
+
+    
+    def _initialize_etf_universe(self):
+        """한국 ETF 유니버스 초기화"""
+        self.categories = {
+            'domestic_equity': {
+                'name': '국내 주식',
+                'subcategories': {
+                    'large_cap': '대형주',
+                    'mid_small_cap': '중소형주', 
+                    'dividend': '배당주',
+                    'value': '가치주',
+                    'growth': '성장주',
+                    'sector': '섹터별'
+                }
+            },
+            'foreign_equity': {
+                'name': '해외 주식',
+                'subcategories': {
+                    'us': '미국',
+                    'developed': '선진국',
+                    'emerging': '신흥국',
+                    'china': '중국',
+                    'japan': '일본',
+                    'europe': '유럽'
+                }
+            },
+            'bonds': {
+                'name': '채권',
+                'subcategories': {
+                    'government': '국채',
+                    'corporate': '회사채',
+                    'foreign_government': '해외국채',
+                    'foreign_corporate': '해외회사채',
+                    'high_yield': '하이일드'
+                }
+            },
+            'alternatives': {
+                'name': '대안투자',
+                'subcategories': {
+                    'reits': '리츠',
+                    'commodities': '원자재',
+                    'gold': '금',
+                    'infrastructure': '인프라'
+                }
+            },
+            'thematic': {
+                'name': '테마/섹터',
+                'subcategories': {
+                    'technology': '기술',
+                    'healthcare': '헬스케어',
+                    'esg': 'ESG',
+                    'battery': '배터리',
+                    'semiconductor': '반도체'
+                }
+            }
+        }
+        
+        # 주요 ETF 데이터 초기화
+        self._load_major_etfs()
+    
+    def _load_major_etfs(self):
+        """주요 ETF 데이터 로드"""
+        major_etfs = {
+            # 국내 주식 ETF
+            '069500': {
+                'name': 'KODEX 200',
+                'category': 'domestic_equity',
+                'subcategory': 'large_cap',
+                'asset_class': 'equity',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.15,
+                'tracking_index': 'KOSPI 200',
+                'fund_company': '삼성자산운용',
+                'description': '코스피 200 지수를 추종하는 대표적인 국내 대형주 ETF',
+                'market_price': 28400,
+                'aum': 20000  # 억원 단위
+            },
+            '114800': {
+                'name': 'KODEX 인버스',
+                'category': 'domestic_equity',
+                'subcategory': 'inverse',
+                'asset_class': 'equity',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.35,
+                'tracking_index': 'KOSPI 200 인버스',
+                'fund_company': '삼성자산운용',
+                'description': '코스피 200 지수의 일일 역방향 수익률을 추종',
+                'market_price': 5800,
+                'aum': 3000
+            },
+            '229200': {
+                'name': 'KODEX 코스닥150',
+                'category': 'domestic_equity',
+                'subcategory': 'growth',
+                'asset_class': 'equity',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.15,
+                'tracking_index': 'KOSDAQ 150',
+                'fund_company': '삼성자산운용',
+                'description': '코스닥 150 지수를 추종하는 성장주 중심 ETF',
+                'market_price': 9800,
+                'aum': 8000
+            },
+            '360750': {
+                'name': 'TIGER 미국S&P500',
+                'category': 'foreign_equity',
+                'subcategory': 'us',
+                'asset_class': 'equity',
+                'region': 'US',
+                'currency': 'USD',
+                'expense_ratio': 0.045,
+                'tracking_index': 'S&P 500',
+                'fund_company': '미래에셋자산운용',
+                'description': '미국 S&P 500 지수를 추종하는 대표적인 미국주식 ETF',
+                'market_price': 15800,
+                'aum': 25000
+            },
+            '133690': {
+                'name': 'KODEX 나스닥100',
+                'category': 'foreign_equity',
+                'subcategory': 'us',
+                'asset_class': 'equity',
+                'region': 'US',
+                'currency': 'USD',
+                'expense_ratio': 0.045,
+                'tracking_index': 'NASDAQ 100',
+                'fund_company': '삼성자산운용',
+                'description': '나스닥 100 지수를 추종하는 미국 기술주 중심 ETF',
+                'market_price': 24500,
+                'aum': 15000
+            },
+            '195930': {
+                'name': 'KODEX 선진국MSCI',
+                'category': 'foreign_equity',
+                'subcategory': 'developed',
+                'asset_class': 'equity',
+                'region': 'Global',
+                'currency': 'USD',
+                'expense_ratio': 0.08,
+                'tracking_index': 'MSCI World',
+                'fund_company': '삼성자산운용',
+                'description': '전 세계 선진국 주식에 분산투자하는 글로벌 ETF',
+                'market_price': 13200,
+                'aum': 5000
+            },
+            '195980': {
+                'name': 'TIGER 신흥국MSCI',
+                'category': 'foreign_equity',
+                'subcategory': 'emerging',
+                'asset_class': 'equity',
+                'region': 'Emerging',
+                'currency': 'USD',
+                'expense_ratio': 0.49,
+                'tracking_index': 'MSCI Emerging Markets',
+                'fund_company': '미래에셋자산운용',
+                'description': '신흥국 주식에 분산투자하는 ETF',
+                'market_price': 8400,
+                'aum': 3000
+            },
+            '160570': {
+                'name': 'TIGER 중국CSI300',
+                'category': 'foreign_equity',
+                'subcategory': 'china',
+                'asset_class': 'equity',
+                'region': 'CN',
+                'currency': 'CNY',
+                'expense_ratio': 0.19,
+                'tracking_index': 'CSI 300',
+                'fund_company': '미래에셋자산운용',
+                'description': '중국 A주 시장의 대형주에 투자하는 ETF',
+                'market_price': 6200,
+                'aum': 2000
+            },
+            # 채권 ETF
+            '114260': {
+                'name': 'KODEX 국고채10년',
+                'category': 'bonds',
+                'subcategory': 'government',
+                'asset_class': 'fixed_income',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.15,
+                'tracking_index': 'KTB 10년 국고채',
+                'fund_company': '삼성자산운용',
+                'description': '10년 만기 국고채에 투자하는 채권 ETF',
+                'market_price': 108500,
+                'aum': 12000
+            },
+            '305080': {
+                'name': 'TIGER 미국채10년',
+                'category': 'bonds',
+                'subcategory': 'foreign_government',
+                'asset_class': 'fixed_income',
+                'region': 'US',
+                'currency': 'USD',
+                'expense_ratio': 0.14,
+                'tracking_index': 'US Treasury 10Y',
+                'fund_company': '미래에셋자산운용',
+                'description': '미국 10년 국채에 투자하는 해외채권 ETF',
+                'market_price': 8900,
+                'aum': 4000
+            },
+            '130730': {
+                'name': 'KODEX 글로벌하이일드',
+                'category': 'bonds',
+                'subcategory': 'high_yield',
+                'asset_class': 'fixed_income',
+                'region': 'Global',
+                'currency': 'USD',
+                'expense_ratio': 0.45,
+                'tracking_index': 'ICE BofA Global High Yield',
+                'fund_company': '삼성자산운용',
+                'description': '글로벌 하이일드 채권에 투자하는 ETF',
+                'market_price': 9500,
+                'aum': 1500
+            },
+            # 리츠 ETF
+            '329200': {
+                'name': 'KODEX 리츠',
+                'category': 'alternatives',
+                'subcategory': 'reits',
+                'asset_class': 'reits',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.5,
+                'tracking_index': 'KRX REITs',
+                'fund_company': '삼성자산운용',
+                'description': '국내 리츠에 투자하는 부동산 ETF',
+                'market_price': 7200,
+                'aum': 800
+            },
+            '351590': {
+                'name': 'TIGER 미국리츠',
+                'category': 'alternatives',
+                'subcategory': 'reits',
+                'asset_class': 'reits',
+                'region': 'US',
+                'currency': 'USD',
+                'expense_ratio': 0.49,
+                'tracking_index': 'FTSE NAREIT Equity REITs',
+                'fund_company': '미래에셋자산운용',
+                'description': '미국 리츠에 투자하는 해외 부동산 ETF',
+                'market_price': 11200,
+                'aum': 2500
+            },
+            # 금 ETF
+            '132030': {
+                'name': 'KODEX 골드선물',
+                'category': 'alternatives',
+                'subcategory': 'gold',
+                'asset_class': 'commodities',
+                'region': 'Global',
+                'currency': 'USD',
+                'expense_ratio': 0.49,
+                'tracking_index': 'Gold Futures',
+                'fund_company': '삼성자산운용',
+                'description': '금 선물에 투자하는 원자재 ETF',
+                'market_price': 9800,
+                'aum': 3500
+            },
+            # 테마 ETF
+            '305540': {
+                'name': 'KODEX 2차전지산업',
+                'category': 'thematic',
+                'subcategory': 'battery',
+                'asset_class': 'equity',
+                'region': 'Global',
+                'currency': 'KRW',
+                'expense_ratio': 0.45,
+                'tracking_index': 'Solactive 2차전지 및 배터리 Value-Chain',
+                'fund_company': '삼성자산운용',
+                'description': '전 세계 2차전지 관련 기업에 투자하는 테마 ETF',
+                'market_price': 18500,
+                'aum': 5000
+            },
+            '091160': {
+                'name': 'KODEX 반도체',
+                'category': 'thematic',
+                'subcategory': 'semiconductor',
+                'asset_class': 'equity',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.49,
+                'tracking_index': 'KRX 반도체',
+                'fund_company': '삼성자산운용',
+                'description': '국내 반도체 기업에 투자하는 섹터 ETF',
+                'market_price': 12800,
+                'aum': 4000
+            },
+            '148020': {
+                'name': 'KODEX ESG Korea',
+                'category': 'thematic',
+                'subcategory': 'esg',
+                'asset_class': 'equity',
+                'region': 'KR',
+                'currency': 'KRW',
+                'expense_ratio': 0.25,
+                'tracking_index': 'KRX ESG Leader 150',
+                'fund_company': '삼성자산운용',
+                'description': 'ESG 우수 기업에 투자하는 지속가능 투자 ETF',
+                'market_price': 14200,
+                'aum': 2000
+            }
+        }
+        
+        self.etf_data = major_etfs
+        logger.info(f"주요 ETF {len(major_etfs)}개 로드 완료")
+    
+    def get_etf_info(self, etf_code: str) -> Optional[Dict]:
+        """특정 ETF 정보 조회"""
+        return self.etf_data.get(etf_code)
+    
+    def get_etfs_by_category(self, category: str, 
+                           subcategory: Optional[str] = None) -> List[Dict]:
+        """카테고리별 ETF 목록 조회"""
+        etfs = []
+        
+        for code, etf_info in self.etf_data.items():
+            if etf_info['category'] == category:
+                if subcategory is None or etf_info.get('subcategory') == subcategory:
+                    etf_info_copy = etf_info.copy()
+                    etf_info_copy['code'] = code
+                    etfs.append(etf_info_copy)
+        
+        return etfs
+    
+    def get_etfs_by_asset_class(self, asset_class: str) -> List[Dict]:
+        """자산군별 ETF 목록 조회"""
+        etfs = []
+        
+        for code, etf_info in self.etf_data.items():
+            if etf_info['asset_class'] == asset_class:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                etfs.append(etf_info_copy)
+        
+        return etfs
+    
+    def get_etfs_by_region(self, region: str) -> List[Dict]:
+        """지역별 ETF 목록 조회"""
+        etfs = []
+        
+        for code, etf_info in self.etf_data.items():
+            if etf_info['region'] == region:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                etfs.append(etf_info_copy)
+        
+        return etfs
+    
+    def search_etfs(self, **filters) -> List[Dict]:
+        """다중 조건 ETF 검색"""
+        etfs = []
+        
+        for code, etf_info in self.etf_data.items():
+            match = True
+            
+            for key, value in filters.items():
+                if key in etf_info:
+                    if isinstance(value, list):
+                        if etf_info[key] not in value:
+                            match = False
+                            break
+                    else:
+                        if etf_info[key] != value:
+                            match = False
+                            break
+                else:
+                    match = False
+                    break
+            
+            if match:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                etfs.append(etf_info_copy)
+        
+        return etfs
+    
+    def get_low_cost_etfs(self, expense_ratio_threshold: float = 0.3) -> List[Dict]:
+        """저비용 ETF 목록 조회"""
+        etfs = []
+        
+        for code, etf_info in self.etf_data.items():
+            if etf_info.get('expense_ratio', 999) <= expense_ratio_threshold:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                etfs.append(etf_info_copy)
+        
+        # 비용 순으로 정렬
+        etfs.sort(key=lambda x: x.get('expense_ratio', 999))
+        return etfs
+    
+    def get_core_satellite_recommendations(self) -> Dict[str, List[Dict]]:
+        """코어-새틀라이트 전략 추천 ETF"""
+        recommendations = {
+            'core': [
+                # 코어 (70-80%): 시장 전체를 대표하는 광범위한 ETF
+                self.etf_data.get('069500'),  # KODEX 200
+                self.etf_data.get('360750'),  # TIGER 미국S&P500
+                self.etf_data.get('195930'),  # KODEX 선진국MSCI
+                self.etf_data.get('114260')   # KODEX 국고채10년
+            ],
+            'satellite': [
+                # 새틀라이트 (20-30%): 성장성이나 테마가 있는 ETF
+                self.etf_data.get('229200'),  # KODEX 코스닥150
+                self.etf_data.get('133690'),  # KODEX 나스닥100
+                self.etf_data.get('195980'),  # TIGER 신흥국MSCI
+                self.etf_data.get('305540'),  # KODEX 2차전지산업
+                self.etf_data.get('329200')   # KODEX 리츠
+            ]
+        }
+        
+        # None 값 제거
+        recommendations['core'] = [etf for etf in recommendations['core'] if etf]
+        recommendations['satellite'] = [etf for etf in recommendations['satellite'] if etf]
+        
+        return recommendations
+    
+    def get_lifecycle_recommendations(self, age: int) -> List[Dict]:
+        """생애주기별 추천 ETF"""
+        if age < 30:
+            # 20대: 공격적 성장 (주식 90%, 채권 10%)
+            recommended_codes = ['360750', '069500', '229200', '133690', '195980']
+        elif age < 40:
+            # 30대: 균형 성장 (주식 80%, 채권 20%)
+            recommended_codes = ['069500', '360750', '195930', '114260', '229200']
+        elif age < 50:
+            # 40대: 안정 성장 (주식 70%, 채권 30%)
+            recommended_codes = ['069500', '360750', '114260', '305080', '329200']
+        else:
+            # 50대+: 자본 보전 (주식 60%, 채권 40%)
+            recommended_codes = ['069500', '114260', '305080', '360750', '130730']
+        
+        recommendations = []
+        for code in recommended_codes:
+            etf_info = self.etf_data.get(code)
+            if etf_info:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                recommendations.append(etf_info_copy)
+        
+        return recommendations
+    
+    def get_global_diversified_portfolio(self) -> List[Dict]:
+        """글로벌 분산 포트폴리오 추천"""
+        recommended_codes = [
+            '069500',  # 국내 주식 25%
+            '360750',  # 미국 주식 30%
+            '195930',  # 선진국 주식 20%
+            '195980',  # 신흥국 주식 10%
+            '114260',  # 국내 채권 10%
+            '305080'   # 해외 채권 5%
+        ]
+        
+        recommendations = []
+        for code in recommended_codes:
+            etf_info = self.etf_data.get(code)
+            if etf_info:
+                etf_info_copy = etf_info.copy()
+                etf_info_copy['code'] = code
+                recommendations.append(etf_info_copy)
+        
+        return recommendations
+    
+    def get_category_summary(self) -> Dict[str, int]:
+        """카테고리별 ETF 개수 요약"""
+        summary = {}
+        
+        for category, info in self.categories.items():
+            count = len([etf for etf in self.etf_data.values() 
+                        if etf['category'] == category])
+            summary[info['name']] = count
+        
+        return summary
+    
+    def add_etf(self, code: str, etf_info: Dict) -> bool:
+        """새로운 ETF 추가"""
+        try:
+            # 필수 필드 검증
+            required_fields = ['name', 'category', 'asset_class', 'region']
+            for field in required_fields:
+                if field not in etf_info:
+                    raise ValueError(f"필수 필드 누락: {field}")
+            
+            self.etf_data[code] = etf_info
+            logger.info(f"ETF 추가 완료: {code} - {etf_info['name']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ETF 추가 실패: {e}")
+            return False
+    
+    def update_etf(self, code: str, updates: Dict) -> bool:
+        """ETF 정보 업데이트"""
+        try:
+            if code not in self.etf_data:
+                logger.warning(f"존재하지 않는 ETF 코드: {code}")
+                return False
+            
+            self.etf_data[code].update(updates)
+            logger.info(f"ETF 정보 업데이트: {code}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ETF 정보 업데이트 실패: {e}")
+            return False
+    
+    def export_etf_list(self, file_path: str) -> bool:
+        """ETF 목록을 CSV로 내보내기"""
+        try:
+            etf_list = []
+            
+            for code, etf_info in self.etf_data.items():
+                etf_record = {'code': code}
+                etf_record.update(etf_info)
+                etf_list.append(etf_record)
+            
+            df = pd.DataFrame(etf_list)
+            df.to_csv(file_path, index=False, encoding='utf-8-sig')
+            
+            logger.info(f"ETF 목록 내보내기 완료: {file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ETF 목록 내보내기 실패: {e}")
+            return False
+    
+    def load_etf_list(self, file_path: str) -> bool:
+        """CSV에서 ETF 목록 가져오기"""
+        try:
+            df = pd.read_csv(file_path, encoding='utf-8-sig')
+            
+            for _, row in df.iterrows():
+                code = row['code']
+                etf_info = row.drop('code').to_dict()
+                
+                # NaN 값을 None으로 변환
+                etf_info = {k: (None if pd.isna(v) else v) 
+                           for k, v in etf_info.items()}
+                
+                self.etf_data[code] = etf_info
+            
+            logger.info(f"ETF 목록 가져오기 완료: {len(df)}개")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ETF 목록 가져오기 실패: {e}")
+            return False
+    
+    def get_etf_comparison(self, etf_codes: List[str]) -> pd.DataFrame:
+        """ETF 비교 분석"""
+        comparison_data = []
+        
+        for code in etf_codes:
+            etf_info = self.etf_data.get(code)
+            if etf_info:
+                comparison_record = {
+                    'ETF코드': code,
+                    'ETF명': etf_info['name'],
+                    '카테고리': self.categories[etf_info['category']]['name'],
+                    '자산군': etf_info['asset_class'],
+                    '지역': etf_info['region'],
+                    '통화': etf_info.get('currency', 'N/A'),
+                    '보수율(%)': etf_info.get('expense_ratio', 'N/A'),
+                    '추적지수': etf_info.get('tracking_index', 'N/A'),
+                    '운용사': etf_info.get('fund_company', 'N/A'),
+                    '현재가': etf_info.get('market_price', 'N/A'),
+                    'AUM(억원)': etf_info.get('aum', 'N/A')
+                }
+                comparison_data.append(comparison_record)
+        
+        return pd.DataFrame(comparison_data)
+    
+    def get_portfolio_allocation_suggestion(self, strategy: str, 
+                                          risk_level: str = 'moderate') -> Dict[str, float]:
+        """전략별 자산배분 제안"""
+        allocations = {
+            'conservative': {
+                'core_satellite': {'069500': 0.4, '114260': 0.4, '360750': 0.2},
+                'global_diversified': {'069500': 0.3, '114260': 0.4, '360750': 0.2, '305080': 0.1},
+                'lifecycle': {'069500': 0.3, '114260': 0.5, '329200': 0.2}
+            },
+            'moderate': {
+                'core_satellite': {'069500': 0.3, '360750': 0.4, '114260': 0.2, '229200': 0.1},
+                'global_diversified': {'069500': 0.25, '360750': 0.3, '195930': 0.2, '114260': 0.15, '195980': 0.1},
+                'lifecycle': {'069500': 0.3, '360750': 0.3, '114260': 0.2, '229200': 0.2}
+            },
+            'aggressive': {
+                'core_satellite': {'360750': 0.4, '069500': 0.25, '229200': 0.2, '133690': 0.15},
+                'global_diversified': {'360750': 0.3, '069500': 0.2, '195930': 0.2, '195980': 0.15, '133690': 0.15},
+                'lifecycle': {'360750': 0.4, '133690': 0.25, '069500': 0.2, '229200': 0.15}
+            }
+        }
+        
+        return allocations.get(risk_level, {}).get(strategy, {})
+    
+    def get_all_etf_codes(self) -> List[str]:
+        """모든 ETF 코드 반환"""
+        return list(self.etf_data.keys())
+    
+    def get_total_market_info(self) -> Dict:
+        """전체 시장 정보 요약"""
+        total_aum = sum(etf.get('aum', 0) for etf in self.etf_data.values())
+        avg_expense_ratio = sum(etf.get('expense_ratio', 0) for etf in self.etf_data.values()) / len(self.etf_data)
+        
+        return {
+            'total_etfs': len(self.etf_data),
+            'total_aum': total_aum,
+            'avg_expense_ratio': avg_expense_ratio,
+            'categories': len(self.categories),
+            'last_updated': datetime.now().isoformat()
+        }
+
+
+# ==========================================
+# 실행 예제 및 테스트 코드
+# ==========================================
+
+if __name__ == "__main__":
+    print("📊 ETF 유니버스 테스트")
+    print("=" * 60)
+    
+    # ETF 유니버스 초기화
+    universe = ETFUniverse()
+    
+    # 전체 시장 정보
+    market_info = universe.get_total_market_info()
+    print(f"\n🌍 전체 시장 정보:")
+    print(f"- 총 ETF: {market_info['total_etfs']}개")
+    print(f"- 총 AUM: {market_info['total_aum']:,.0f}억원")
+    print(f"- 평균 보수율: {market_info['avg_expense_ratio']:.3f}%")
+    print(f"- 카테고리: {market_info['categories']}개")
+    
+    # 카테고리별 요약
+    print(f"\n📋 카테고리별 ETF 개수:")
+    category_summary = universe.get_category_summary()
+    for category, count in category_summary.items():
+        print(f"- {category}: {count}개")
+    
+    # 저비용 ETF 조회
+    print(f"\n💰 저비용 ETF (보수율 0.2% 이하):")
+    low_cost_etfs = universe.get_low_cost_etfs(0.2)
+    for etf in low_cost_etfs[:5]:
+        print(f"- {etf['name']} ({etf['code']}): {etf['expense_ratio']}%")
+    
+    # 코어-새틀라이트 추천
+    print(f"\n🎯 코어-새틀라이트 전략 추천:")
+    recommendations = universe.get_core_satellite_recommendations()
+    
+    print(f"코어 ETF:")
+    for etf in recommendations['core']:
+        print(f"- {etf['name']} ({etf.get('expense_ratio', 'N/A')}%)")
+    
+    print(f"새틀라이트 ETF:")
+    for etf in recommendations['satellite']:
+        print(f"- {etf['name']} ({etf.get('expense_ratio', 'N/A')}%)")
+    
+    # 생애주기별 추천 (35세)
+    print(f"\n🔄 생애주기 전략 (35세):")
+    lifecycle_etfs = universe.get_lifecycle_recommendations(35)
+    for i, etf in enumerate(lifecycle_etfs, 1):
+        print(f"{i}. {etf['name']} - {etf['description'][:50]}...")
+    
+    # ETF 비교
+    print(f"\n⚖️ 주요 ETF 비교:")
+    comparison_codes = ['069500', '360750', '114260']
+    comparison_df = universe.get_etf_comparison(comparison_codes)
+    print(comparison_df.to_string(index=False))
+    
+    print(f"\n✅ ETF 유니버스 테스트 완료!")
+    print(f"💡 다음 단계:")
+    print(f"   - python data/database_manager.py : 데이터베이스 관리 테스트")
+    print(f"   - python core/portfolio_manager.py : 포트폴리오 관리 테스트")

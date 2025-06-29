@@ -1,0 +1,589 @@
+# ==========================================
+# data/market_data_collector.py - 시장데이터 수집 (수정 버전)
+# ==========================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import time
+import sqlite3
+import warnings
+import logging
+warnings.filterwarnings('ignore')
+
+# pykrx import 시도
+try:
+    from pykrx import stock
+    PYKRX_AVAILABLE = True
+    print("pykrx.stock 모듈 import 성공")
+except ImportError as e:
+    PYKRX_AVAILABLE = False
+    print(f"pykrx import 실패: {e}")
+    print("pip install pykrx 로 설치하면 실시간 데이터 수집이 가능합니다")
+
+class MarketDataCollector:
+    """pykrx 기반 시장 데이터 수집 클래스 (수정 버전)"""
+    
+    def __init__(self, db_path: str = "etf_universe.db"):
+        self.db_path = db_path
+        self.pykrx_available = PYKRX_AVAILABLE
+        
+        # 로깅 설정
+        self.logger = logging.getLogger(__name__)
+        
+        print(f"MarketDataCollector 초기화 (DB: {db_path})")
+        if not self.pykrx_available:
+            print("pykrx 없이 시뮬레이션 모드로 실행됩니다")
+    
+    def get_etf_list(self) -> list:
+        """거래 가능한 ETF 리스트 조회"""
+        if not self.pykrx_available:
+            # 기본 ETF 리스트 반환
+            default_etfs = ['069500', '360750', '114260', '133690', '195930']
+            print(f"기본 ETF 리스트 사용: {len(default_etfs)}개")
+            return default_etfs
+        
+        try:
+            # pykrx에서 ETF 티커 리스트 가져오기
+            print("pykrx에서 ETF 리스트 조회 중...")
+            etf_tickers = stock.get_market_ticker_list(market="ETF")
+            print(f"ETF 리스트 조회 성공: {len(etf_tickers)}개")
+            return etf_tickers
+        except Exception as e:
+            print(f"ETF 리스트 조회 실패: {e}")
+            # 주요 ETF 수동 리스트 반환
+            fallback_etfs = ['069500', '360750', '114260', '133690', '195930']
+            print(f"대체 ETF 리스트 사용: {len(fallback_etfs)}개")
+            return fallback_etfs
+    
+    def fetch_etf_price_data(self, code: str, period: str = "1y") -> pd.DataFrame:
+        """ETF 가격 데이터 수집 (강화된 오류 처리)"""
+        if not self.pykrx_available:
+            # 시뮬레이션 데이터 생성
+            return self._generate_simulation_data(code, period)
+        
+        try:
+            # 기간 설정 (최근 거래일 기준)
+            recent_trading_date = self._get_recent_trading_date()
+            end_date = recent_trading_date
+            
+            if period == "1y":
+                start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+            elif period == "6m":
+                start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=180)).strftime("%Y%m%d")
+            elif period == "3m":
+                start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+            elif period == "1m":
+                start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
+            else:
+                start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+            
+            print(f"{code} 가격 데이터 수집: {start_date} ~ {end_date}")
+            
+            # pykrx로 OHLCV 데이터 수집 (재시도 로직 추가)
+            df = None
+            max_retries = 3
+            
+            for retry in range(max_retries):
+                try:
+                    df = stock.get_market_ohlcv_by_date(start_date, end_date, code)
+                    if not df.empty:
+                        break
+                    time.sleep(1)  # 재시도 전 대기
+                except Exception as retry_e:
+                    print(f"{code} 데이터 수집 시도 {retry+1} 실패: {retry_e}")
+                    if retry < max_retries - 1:
+                        time.sleep(2)  # 재시도 전 대기
+                    continue
+            
+            if df is None or df.empty:
+                print(f"{code}: pykrx 데이터 없음, 시뮬레이션 데이터 생성")
+                return self._generate_simulation_data(code, period)
+            
+            # 데이터 정리
+            df = df.reset_index()
+            df['code'] = code
+            df['Date'] = df['날짜'].astype(str)
+            df['Open'] = df['시가']
+            df['High'] = df['고가'] 
+            df['Low'] = df['저가']
+            df['Close'] = df['종가']
+            df['Volume'] = df['거래량']
+            
+            print(f"{code}: {len(df)}건 실제 데이터 수집 완료")
+            return df[['code', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+            
+        except Exception as e:
+            print(f"{code} pykrx 데이터 수집 실패: {e}")
+            print(f"{code} 시뮬레이션 데이터로 대체")
+            return self._generate_simulation_data(code, period)
+    
+    def _generate_simulation_data(self, code: str, period: str = "1y") -> pd.DataFrame:
+        """시뮬레이션 데이터 생성 (pykrx 없을 때)"""
+        try:
+            # 기간별 일수 계산
+            if period == "1y":
+                days = 252  # 거래일 기준
+            elif period == "6m":
+                days = 126
+            elif period == "3m":
+                days = 63
+            elif period == "1m":
+                days = 21
+            else:
+                days = 252
+            
+            # 기본 가격 설정 (ETF별 대략적 실제 가격)
+            base_prices = {
+                '069500': 28400,   # KODEX 200
+                '360750': 15800,   # TIGER 미국S&P500
+                '114260': 108500,  # KODEX 국고채10년
+                '133690': 24500,   # KODEX 나스닥100
+                '195930': 13200,   # KODEX 선진국MSCI World
+            }
+            
+            base_price = base_prices.get(code, 10000)
+            
+            # 날짜 생성 (거래일만)
+            dates = []
+            current_date = datetime.now() - timedelta(days=days*1.4)  # 주말 고려
+            
+            while len(dates) < days:
+                if current_date.weekday() < 5:  # 평일만
+                    dates.append(current_date.strftime('%Y-%m-%d'))
+                current_date += timedelta(days=1)
+            
+            # 가격 데이터 생성 (랜덤워크)
+            np.random.seed(hash(code) % 2**32)  # 코드별 일관된 시드
+            returns = np.random.normal(0.0005, 0.015, days)  # 일일 수익률
+            
+            prices = [base_price]
+            for i in range(1, days):
+                price = prices[-1] * (1 + returns[i])
+                prices.append(max(price, base_price * 0.7))  # 최소 30% 하락 제한
+            
+            # OHLCV 데이터 생성
+            data = []
+            for i, (date, close) in enumerate(zip(dates, prices)):
+                # Open/High/Low 생성
+                daily_volatility = abs(returns[i] if i < len(returns) else 0.001)
+                open_price = close * (1 + np.random.normal(0, daily_volatility * 0.3))
+                high_price = max(open_price, close) * (1 + np.random.uniform(0, daily_volatility))
+                low_price = min(open_price, close) * (1 - np.random.uniform(0, daily_volatility))
+                
+                # Volume 생성
+                base_volume = {'069500': 1200000, '360750': 2800000, '114260': 450000, 
+                              '133690': 890000, '195930': 340000}.get(code, 100000)
+                volume = int(base_volume * np.random.uniform(0.3, 2.0))
+                
+                data.append({
+                    'code': code,
+                    'Date': date,
+                    'Open': round(open_price, 0),
+                    'High': round(high_price, 0),
+                    'Low': round(low_price, 0),
+                    'Close': round(close, 0),
+                    'Volume': volume
+                })
+            
+            df = pd.DataFrame(data)
+            print(f"{code}: {len(df)}건 시뮬레이션 데이터 생성 완료")
+            return df
+            
+        except Exception as e:
+            print(f"{code} 시뮬레이션 데이터 생성 실패: {e}")
+            return pd.DataFrame()
+    
+    def fetch_etf_info(self, code: str) -> dict:
+        """ETF 기본 정보 수집 (강화된 오류 처리)"""
+        if not self.pykrx_available:
+            return self._generate_simulation_info(code)
+        
+        try:
+            # 가장 최근 거래일 찾기
+            recent_trading_date = self._get_recent_trading_date()
+            
+            # 기본 시장 정보 (최근 거래일부터 역순으로 조회)
+            market_data = None
+            trading_dates = self._get_recent_trading_dates(10)  # 최근 10거래일
+            
+            for test_date in trading_dates:
+                try:
+                    date_str = test_date.strftime("%Y%m%d")
+                    market_data = stock.get_market_ohlcv_by_date(date_str, date_str, code)
+                    if not market_data.empty:
+                        print(f"{code} 데이터 조회 성공: {date_str}")
+                        break
+                    time.sleep(0.3)  # API 제한 고려
+                except Exception as e:
+                    continue
+            
+            if market_data is None or market_data.empty:
+                print(f"{code}: pykrx 정보 없음, 시뮬레이션 정보 생성")
+                return self._generate_simulation_info(code)
+            
+            latest_data = market_data.iloc[-1]
+            current_price = latest_data['종가']
+            volume = latest_data['거래량']
+            
+            # 시가총액 정보 시도 (오류 발생시 스킵)
+            market_cap = 0
+            try:
+                cap_data = stock.get_market_cap_by_date(recent_trading_date, recent_trading_date, code)
+                if not cap_data.empty:
+                    market_cap = cap_data.iloc[-1]['시가총액'] / 100000000  # 억원 단위
+            except Exception as cap_e:
+                # 시가총액 조회 실패는 치명적이지 않으므로 로그만 남김
+                pass
+            
+            # ETF 정보
+            etf_info = {
+                'current_price': float(current_price) if current_price else 0,
+                'volume': int(volume) if volume else 0,
+                'market_cap': float(market_cap) if market_cap else 0,
+                'nav': float(current_price * 0.999) if current_price else 0,  # 임시 NAV
+                'premium_discount': round(np.random.uniform(-0.5, 0.5), 3),  # 임시 괴리율
+                'dividend_yield': round(np.random.uniform(0, 4), 2),  # 임시 배당률
+                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            print(f"{code} 실제 정보 수집 완료: {etf_info['current_price']:,.0f}원")
+            return etf_info
+            
+        except Exception as e:
+            print(f"{code} pykrx 정보 수집 실패: {e}")
+            return self._generate_simulation_info(code)
+    
+    def _generate_simulation_info(self, code: str) -> dict:
+        """시뮬레이션 ETF 정보 생성"""
+        base_info = {
+            '069500': {'price': 28400, 'volume': 1200000, 'yield': 1.8},
+            '360750': {'price': 15800, 'volume': 2800000, 'yield': 1.3},
+            '114260': {'price': 108500, 'volume': 450000, 'yield': 3.1},
+            '133690': {'price': 24500, 'volume': 890000, 'yield': 0.8},
+            '195930': {'price': 13200, 'volume': 340000, 'yield': 2.1},
+        }
+        
+        info = base_info.get(code, {'price': 10000, 'volume': 100000, 'yield': 2.0})
+        
+        # 약간의 변동성 추가
+        price_variation = np.random.uniform(0.98, 1.02)
+        volume_variation = np.random.uniform(0.7, 1.3)
+        
+        etf_info = {
+            'current_price': round(info['price'] * price_variation),
+            'volume': int(info['volume'] * volume_variation),
+            'market_cap': round(info['price'] * price_variation * 1000),  # 임시 시가총액
+            'nav': round(info['price'] * price_variation * 0.999),
+            'premium_discount': round(np.random.uniform(-0.5, 0.5), 3),
+            'dividend_yield': info['yield'],
+            'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        print(f"{code} 시뮬레이션 정보 생성: {etf_info['current_price']:,.0f}원")
+        return etf_info
+    
+    def _get_recent_trading_date(self) -> str:
+        """가장 최근 거래일 조회 (한국 증시 기준)"""
+        current_date = datetime.now()
+        
+        # 현재 시간이 15:30 이전이고 평일이면 전일 확인
+        if current_date.hour < 15 or (current_date.hour == 15 and current_date.minute < 30):
+            current_date = current_date - timedelta(days=1)
+        
+        # 가장 최근 거래일 찾기 (주말과 주요 공휴일 제외)
+        while not self._is_trading_day(current_date):
+            current_date = current_date - timedelta(days=1)
+        
+        return current_date.strftime("%Y%m%d")
+    
+    def _get_recent_trading_dates(self, count: int = 10) -> list:
+        """최근 거래일 목록 조회 (한국 증시 기준)"""
+        trading_dates = []
+        current_date = datetime.now()
+        
+        # 현재 시간이 15:30 이전이고 평일이면 전일부터 시작
+        if current_date.hour < 15 or (current_date.hour == 15 and current_date.minute < 30):
+            current_date = current_date - timedelta(days=1)
+        
+        # 최근 거래일들 수집
+        while len(trading_dates) < count:
+            if self._is_trading_day(current_date):
+                trading_dates.append(current_date)
+            current_date = current_date - timedelta(days=1)
+        
+        return trading_dates
+    
+    def _is_trading_day(self, date: datetime) -> bool:
+        """거래일 여부 확인 (한국 증시 기준)"""
+        # 주말 체크
+        if date.weekday() >= 5:  # 5=토요일, 6=일요일
+            return False
+        
+        # 주요 공휴일 체크 (간소화된 버전)
+        year = date.year
+        month = date.month
+        day = date.day
+        
+        # 고정 공휴일들
+        fixed_holidays = [
+            (1, 1),   # 신정
+            (3, 1),   # 삼일절  
+            (5, 5),   # 어린이날
+            (6, 6),   # 현충일
+            (8, 15),  # 광복절
+            (10, 3),  # 개천절
+            (10, 9),  # 한글날
+            (12, 25), # 크리스마스
+        ]
+        
+        if (month, day) in fixed_holidays:
+            return False
+        
+        # 연휴가 겹치는 경우 (간소화)
+        # 실제로는 더 복잡한 대체공휴일 로직이 필요하지만,
+        # 데이터 조회 실패시 다음 날짜로 넘어가므로 큰 문제없음
+        
+        return True
+    
+    def calculate_performance_metrics(self, price_data: pd.DataFrame) -> dict:
+        """성과 지표 계산"""
+        if price_data.empty:
+            return {}
+        
+        try:
+            price_data = price_data.copy()
+            price_data['Date'] = pd.to_datetime(price_data['Date'])
+            price_data = price_data.sort_values('Date')
+            
+            # 수익률 계산
+            price_data['returns'] = price_data['Close'].pct_change()
+            
+            # 누적 수익률
+            cumulative_return = (price_data['Close'].iloc[-1] / price_data['Close'].iloc[0] - 1) * 100
+            
+            # 변동성 (연율화)
+            volatility = price_data['returns'].std() * np.sqrt(252) * 100
+            
+            # 샤프 비율 (무위험 수익률 3% 가정)
+            excess_returns = price_data['returns'].mean() * 252 - 0.03
+            sharpe_ratio = excess_returns / (volatility / 100) if volatility > 0 else 0
+            
+            # 최대 낙폭 (MDD)
+            price_data['peak'] = price_data['Close'].expanding(min_periods=1).max()
+            price_data['drawdown'] = (price_data['Close'] / price_data['peak'] - 1) * 100
+            max_drawdown = price_data['drawdown'].min()
+            
+            # 평균 거래량
+            avg_volume = price_data['Volume'].mean()
+            
+            # 최근 성과 지표들
+            recent_periods = [5, 20, 60]  # 1주, 1달, 3달
+            recent_returns = {}
+            
+            for period in recent_periods:
+                if len(price_data) >= period:
+                    recent_return = (price_data['Close'].iloc[-1] / price_data['Close'].iloc[-period] - 1) * 100
+                    recent_returns[f'{period}d_return'] = round(recent_return, 2)
+                else:
+                    recent_returns[f'{period}d_return'] = 0
+            
+            # 거래량 추세
+            if len(price_data) >= 20:
+                recent_volume = price_data['Volume'].tail(20).mean()
+                volume_trend = (recent_volume / avg_volume - 1) * 100 if avg_volume > 0 else 0
+            else:
+                volume_trend = 0
+            
+            # 가격 추세 (선형 회귀 기울기)
+            if len(price_data) >= 20:
+                x = np.arange(len(price_data.tail(20)))
+                y = price_data['Close'].tail(20).values
+                slope = np.polyfit(x, y, 1)[0]
+                price_trend = (slope / price_data['Close'].iloc[-1]) * 100  # 일일 추세율
+            else:
+                price_trend = 0
+            
+            metrics = {
+                'cumulative_return': round(cumulative_return, 2),
+                'volatility': round(volatility, 2),
+                'sharpe_ratio': round(sharpe_ratio, 2),
+                'max_drawdown': round(max_drawdown, 2),
+                'avg_volume': int(avg_volume),
+                'volume_trend': round(volume_trend, 2),
+                'price_trend': round(price_trend, 3),
+                'current_price': round(price_data['Close'].iloc[-1], 0),
+                'data_points': len(price_data),
+                **recent_returns
+            }
+            
+            print(f"성과 지표 계산 완료: 수익률 {metrics['cumulative_return']}%, 변동성 {metrics['volatility']}%")
+            return metrics
+            
+        except Exception as e:
+            print(f"성과 지표 계산 실패: {e}")
+            return {}
+    
+    def get_current_price(self, etf_code: str) -> float:
+        """현재 가격 조회 (단일 ETF)"""
+        try:
+            etf_info = self.fetch_etf_info(etf_code)
+            return etf_info.get('current_price', 0)
+        except:
+            return 0
+    
+    def test_connection(self) -> bool:
+        """연결 테스트 (강화됨)"""
+        print(f"\n연결 테스트 시작")
+        
+        if not self.pykrx_available:
+            print(f"pykrx 없음 - 시뮬레이션 모드 테스트")
+            
+            # 시뮬레이션 데이터 테스트
+            test_data = self._generate_simulation_data('069500', '1m')
+            test_info = self._generate_simulation_info('069500')
+            
+            if not test_data.empty and test_info:
+                print(f"시뮬레이션 모드 정상 작동")
+                return True
+            else:
+                print(f"시뮬레이션 모드 오류")
+                return False
+        
+        # pykrx 연결 테스트
+        try:
+            print(f"pykrx 연결 테스트...")
+            test_code = '069500'  # KODEX 200
+            
+            # ETF 리스트 조회 테스트
+            etf_list = self.get_etf_list()
+            if len(etf_list) > 0:
+                print(f"ETF 리스트 조회 성공: {len(etf_list)}개")
+            else:
+                print(f"ETF 리스트 조회 실패")
+                return False
+            
+            # 가격 데이터 테스트
+            price_data = self.fetch_etf_price_data(test_code, '1m')
+            if not price_data.empty:
+                print(f"가격 데이터 수집 성공: {len(price_data)}건")
+            else:
+                print(f"가격 데이터 수집 실패")
+            
+            # ETF 정보 테스트
+            etf_info = self.fetch_etf_info(test_code)
+            if etf_info and etf_info.get('current_price', 0) > 0:
+                print(f"ETF 정보 수집 성공: {etf_info['current_price']:,.0f}원")
+            else:
+                print(f"ETF 정보 수집 실패")
+            
+            print(f"pykrx 연결 테스트 완료")
+            return True
+            
+        except Exception as e:
+            print(f"pykrx 연결 테스트 실패: {e}")
+            return False
+
+
+# ==========================================
+# 실행 예제 및 테스트 코드
+# ==========================================
+
+if __name__ == "__main__":
+    print("ETF 시장데이터 수집 테스트 (거래일 고려 버전)")
+    print("=" * 60)
+    
+    # 데이터 수집기 초기화
+    collector = MarketDataCollector()
+    
+    # 거래일 정보 확인
+    print(f"\n거래일 정보:")
+    recent_trading_date = collector._get_recent_trading_date()
+    print(f"- 가장 최근 거래일: {recent_trading_date}")
+    
+    recent_dates = collector._get_recent_trading_dates(5)
+    print(f"- 최근 5거래일:")
+    for i, date in enumerate(recent_dates):
+        print(f"  {i+1}. {date.strftime('%Y-%m-%d (%a)')}")
+    
+    # 현재 시간이 거래일인지 확인
+    now = datetime.now()
+    is_trading = collector._is_trading_day(now)
+    print(f"- 오늘({now.strftime('%Y-%m-%d %a')}) 거래일 여부: {'예' if is_trading else '아니오'}")
+    
+    # 연결 테스트
+    print(f"\n1. 연결 및 기능 테스트")
+    connection_ok = collector.test_connection()
+    
+    if not connection_ok:
+        print(f"연결 테스트 실패 - 기본 기능만 테스트")
+    
+    # 테스트할 주요 ETF 코드들
+    test_etfs = ['069500', '360750', '114260']  # 대표 3개만
+    
+    print(f"\n테스트 대상 ETF: {len(test_etfs)}개")
+    for i, code in enumerate(test_etfs):
+        print(f"  {i+1}. {code}")
+    
+    # 2. 개별 ETF 가격 데이터 테스트
+    print(f"\n2. 개별 ETF 가격 데이터 수집 테스트 (최근 거래일 기준)")
+    test_code = test_etfs[0]  # KODEX 200
+    
+    try:
+        price_data = collector.fetch_etf_price_data(test_code, period="1m")
+        if not price_data.empty:
+            print(f"{test_code} 가격 데이터 수집 성공")
+            print(f"   - 데이터 건수: {len(price_data)}건")
+            print(f"   - 기간: {price_data['Date'].min()} ~ {price_data['Date'].max()}")
+            print(f"   - 최신 가격: {price_data['Close'].iloc[-1]:,.0f}원")
+            print(f"   - 평균 거래량: {price_data['Volume'].mean():,.0f}주")
+        else:
+            print(f"{test_code} 가격 데이터 수집 실패")
+    except Exception as e:
+        print(f"가격 데이터 수집 오류: {e}")
+    
+    # 3. ETF 정보 수집 테스트
+    print(f"\n3. ETF 기본 정보 수집 테스트 (최근 거래일 기준)")
+    try:
+        etf_info = collector.fetch_etf_info(test_code)
+        if etf_info:
+            print(f"{test_code} ETF 정보 수집 성공")
+            print(f"   - 현재가: {etf_info.get('current_price', 0):,.0f}원")
+            print(f"   - 거래량: {etf_info.get('volume', 0):,}주")
+            print(f"   - NAV: {etf_info.get('nav', 0):,.0f}원")
+            print(f"   - 괴리율: {etf_info.get('premium_discount', 0):+.3f}%")
+            print(f"   - 배당수익률: {etf_info.get('dividend_yield', 0):.2f}%")
+        else:
+            print(f"{test_code} ETF 정보 수집 실패")
+    except Exception as e:
+        print(f"ETF 정보 수집 오류: {e}")
+    
+    # 4. 성과 지표 계산 테스트
+    print(f"\n4. 성과 지표 계산 테스트")
+    try:
+        if 'price_data' in locals() and not price_data.empty:
+            metrics = collector.calculate_performance_metrics(price_data)
+            if metrics:
+                print(f"{test_code} 성과 지표 계산 성공")
+                print(f"   - 누적 수익률: {metrics.get('cumulative_return', 0):+.2f}%")
+                print(f"   - 1주일 수익률: {metrics.get('5d_return', 0):+.2f}%")
+                print(f"   - 변동성: {metrics.get('volatility', 0):.2f}%")
+                print(f"   - 샤프 비율: {metrics.get('sharpe_ratio', 0):.2f}")
+                print(f"   - 최대 낙폭: {metrics.get('max_drawdown', 0):.2f}%")
+            else:
+                print(f"{test_code} 성과 지표 계산 실패")
+    except Exception as e:
+        print(f"성과 지표 계산 오류: {e}")
+    
+    print(f"\nETF 데이터 수집 테스트 완료!")
+    
+    if collector.pykrx_available:
+        print(f"\npykrx 거래일 최적화 적용:")
+        print(f"   - 자동으로 가장 최근 거래일 데이터 조회")
+        print(f"   - 주말/공휴일에도 안정적인 데이터 수집")
+        print(f"   - 장마감 후 일괄 업데이트 권장")
+    else:
+        print(f"\n시뮬레이션 모드 정보:")
+        print(f"   - 실제 데이터와 유사한 패턴의 시뮬레이션 데이터 제공")
+        print(f"   - 테스트 및 개발 목적으로 활용 가능")
+        print(f"   - pip install pykrx 후 실제 데이터 수집 가능")
