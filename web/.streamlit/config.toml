@@ -1,26 +1,12 @@
-# ==============================================
-# 4. web/.streamlit/config.toml - Streamlit 설정
-# ==============================================
-
-"""
-[global]
-developmentMode = false
-
 [server]
 maxUploadSize = 1000
-headless = false
-port = 8501
 enableCORS = false
-enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#1f77b4"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
+primaryColor = "#FF6B6B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
 textColor = "#262730"
-font = "sans serif"
-
-"""
